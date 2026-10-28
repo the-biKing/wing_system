@@ -1,0 +1,3 @@
+# Local machine / developer specific configurations
+.vscode/
+flash.ps1
