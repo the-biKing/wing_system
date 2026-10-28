@@ -1,0 +1,26 @@
+{
+  "configurations": [
+    {
+      "name": "ESP32 NodeMCU-32S",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "C:/Users/joshh/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.12/cores/esp32/**",
+        "C:/Users/joshh/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.12/variants/nodemcu-32s/**",
+        "C:/Users/joshh/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.12/libraries/**",
+        "C:/Users/joshh/Documents/Arduino/libraries/**"
+      ],
+      "defines": [
+        "ESP32",
+        "ARDUINO=10819",
+        "ARDUINO_ARCH_ESP32",
+        "ARDUINO_BOARD=\"NODEMCU_32S\"",
+        "F_CPU=240000000L"
+      ],
+      "compilerPath": "C:/Users/joshh/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2601/bin/xtensa-esp32-elf-g++.exe",
+      "cStandard": "c11",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "gcc-x64"
+    }
+  ],
+  "version": 4
+}

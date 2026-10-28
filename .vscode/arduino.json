@@ -1,0 +1,7 @@
+{
+  "board": "esp32:esp32:nodemcu-32s",
+  "boardName": "NodeMCU-32S (ESP32)",
+  "port": "auto",
+  "baudRate": 115200,
+  "arduinoCliPath": "G:\\Arduino\\Arduino IDE\\resources\\app\\lib\\backend\\resources\\arduino-cli.exe"
+}
