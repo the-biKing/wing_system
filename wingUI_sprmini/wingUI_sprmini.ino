@@ -523,6 +523,18 @@ void playMotorEntranceAnim() {
   drawTacticalString(cx + (98 - rpmW) / 2, cy + 69, rpmBuf, COLOR_LIGHTGREY, COLOR_BG, 1);
 }
 
+const uint16_t *getTemperatureIcon(float temp) {
+  if (temp < 30.0f) {
+    return icon_T_low;
+  } else if (temp < 45.0f) {
+    return icon_T_norm;
+  } else if (temp < 50.0f) {
+    return icon_T_mid;
+  } else {
+    return icon_T_high;
+  }
+}
+
 void playSensorsEntranceAnim() {
   int cx = 14, cy = 19;
   tft.fillRect(cx + 1, cy + 1, 98, 90, COLOR_BG);
@@ -547,15 +559,15 @@ void playSensorsEntranceAnim() {
   delay(40);
 
   // 升溫動畫[cite: 7]
-  const uint8_t* tempFrames[4] = {icon_T_low, icon_T_norm, icon_T_mid, icon_T_high};
+  const uint16_t* tempFrames[4] = {icon_T_low, icon_T_norm, icon_T_mid, icon_T_high};
   int iconX = boxX + boxW - ICON_T_HIGH_W - 5;
   int iconY = boxY + (boxH - ICON_T_HIGH_H) / 2;
 
   for (int f = 0; f < 4; f++) {
-    uint16_t frameCol = (f == 3) ? COLOR_AMBER : (f >= 1 ? COLOR_GREEN : COLOR_CYAN);
-    tft.drawBitmap(iconX, iconY, tempFrames[f], ICON_T_HIGH_W, ICON_T_HIGH_H, frameCol, COLOR_BG);
+    tft.drawRGBBitmap(iconX, iconY, tempFrames[f], ICON_T_HIGH_W, ICON_T_HIGH_H);
     delay(45);
   }
+  tft.drawRGBBitmap(iconX, iconY, getTemperatureIcon(sysTemp), ICON_T_HIGH_W, ICON_T_HIGH_H);
 
   // 數值砸入
   tft.fillRect(boxX + 2, boxY + 2, boxW - ICON_T_HIGH_W - 10, boxH - 4, COLOR_CYAN);
@@ -664,7 +676,7 @@ void drawCentralCardContent() {
 
     int iconX = boxX + boxW - ICON_T_HIGH_W - 5;
     int iconY = boxY + (boxH - ICON_T_HIGH_H) / 2;
-    tft.drawBitmap(iconX, iconY, icon_T_high, ICON_T_HIGH_W, ICON_T_HIGH_H, COLOR_AMBER, COLOR_BG);
+    tft.drawRGBBitmap(iconX, iconY, getTemperatureIcon(sysTemp), ICON_T_HIGH_W, ICON_T_HIGH_H);
 
     int bY = cy + 49, bW = 39, bH = 26;
     int vBoxX = cx + 8;
@@ -707,12 +719,17 @@ void playCyberTransition(bool toRight) {
 void drawSubpageScreen() {
   tft.fillScreen(COLOR_BG);
 
-  tft.fillRect(0, 0, 128, 15, COLOR_CYAN);
-  tft.drawLine(0, 15, 128, 15, COLOR_WHITE);
+  tft.drawFastHLine(0, 16, 40, COLOR_MIDGREY);
+  tft.drawFastHLine(44, 16, 40, COLOR_CYAN);
+  tft.drawFastHLine(88, 16, 40, COLOR_MIDGREY);
+  tft.drawPixel(42, 16, COLOR_AMBER);
+  tft.drawPixel(86, 16, COLOR_AMBER);
 
-  if (carouselIndex == PAGE_LIGHT)   drawTacticalString(4, 4, "CONFIG // LIGHT", COLOR_BG, COLOR_CYAN, 1);
-  if (carouselIndex == PAGE_MOTOR)   drawTacticalString(4, 4, "CONFIG // ACTUATOR", COLOR_BG, COLOR_CYAN, 1);
-  if (carouselIndex == PAGE_SENSORS) drawTacticalString(4, 4, "SYS // DIAGNOSE", COLOR_BG, COLOR_CYAN, 1);
+  const char *title = "";
+  if (carouselIndex == PAGE_LIGHT)   title = "LIGHT";
+  if (carouselIndex == PAGE_MOTOR)   title = "MOTOR";
+  if (carouselIndex == PAGE_SENSORS) title = "THERMAL";
+  drawTacticalString(6, 4, title, COLOR_AMBER, COLOR_BG, 1);
 
   int startY = 19;
 
