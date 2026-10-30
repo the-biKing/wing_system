@@ -1,16 +1,23 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
+#include <Adafruit_VL53L0X.h>
+#include <DallasTemperature.h>
+#include <OneWire.h>
 #include <SPI.h>
 #include <Wire.h>
-#include <Adafruit_VL53L0X.h>
 #include <math.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
+
+#include <Preferences.h>
+#include <driver/rtc_io.h>
 
 #include "config.h"
-#include "sfx.h"
 #include "custom_font.h"
 #include "hud_icons.h"
+#include "sfx.h"
+
+// 全域 NVS 與系統設定
+Preferences preferences;
+bool isMuted = false;
 
 // --- 戰術 HUD 16-bit RGB565 色盤 ---
 #define COLOR_BG 0x0000        // 深空黑底
@@ -205,7 +212,8 @@ struct LightConfig {
   uint8_t sat = CFG_DEFAULT_SAT;
   uint8_t val = CFG_DEFAULT_VAL;
   uint8_t style = MODE_STATIC;
-  int8_t speed = CFG_DEFAULT_LIGHT_SPEED; // 特效速度 (支援負值: RAINING 模式 -50 ~ +50, 其他 1 ~ 100)
+  int8_t speed = CFG_DEFAULT_LIGHT_SPEED; // 特效速度 (支援負值: RAINING 模式
+                                          // -50 ~ +50, 其他 1 ~ 100)
 } lightCfg, lightBackup;
 
 void hsvToRgb(uint16_t h, uint8_t s, uint8_t v, uint8_t &r, uint8_t &g,
@@ -259,7 +267,8 @@ uint16_t hsvToRgb565(uint16_t h, uint8_t s, uint8_t v) {
   return tft.color565(r, g, b);
 }
 
-// ================= 動態燈效動畫引擎 (Dynamic Light Mode Engine) =================
+// ================= 動態燈效動畫引擎 (Dynamic Light Mode Engine)
+// =================
 unsigned long lastLightAnimTick = 0;
 float animRainbowPhase = 0.0f;
 float animBreathePhase = 0.0f;
@@ -306,7 +315,8 @@ void updateThunderAnimation(unsigned long now) {
         thunderState = THUNDER_IDLE;
         thunderBrightness = 0;
         // 依據 lightCfg.speed (1 ~ 100) 決定下一次雷擊等待時間 (100最快、1最慢)
-        unsigned long baseWait = map(constrain((int)lightCfg.speed, 1, 100), 1, 100, 3200, 250);
+        unsigned long baseWait =
+            map(constrain((int)lightCfg.speed, 1, 100), 1, 100, 3200, 250);
         thunderNextEvent = now + random(baseWait / 2, baseWait * 3 / 2);
       }
     }
@@ -320,7 +330,8 @@ void updatePartyAnimation(unsigned long now) {
     // 亮度隨機，但嚴格由 lightCfg.val 作為上限守護 (guarded by brightness)
     partyCurBri = (uint8_t)(random(40, 101) * lightCfg.val / 100);
     // 切換間隔由 speed 控制 (100最快 ~60ms, 1最慢 ~700ms)
-    unsigned long interval = map(constrain((int)lightCfg.speed, 1, 100), 1, 100, 700, 60);
+    unsigned long interval =
+        map(constrain((int)lightCfg.speed, 1, 100), 1, 100, 700, 60);
     partyNextSwitch = now + interval;
   }
 }
@@ -332,7 +343,8 @@ void drawLightPreviewCircle(int rx, int ry, int r) {
     tft.drawCircle(rx, ry, r, COLOR_WHITE);
   } else if (lightCfg.style == MODE_RAINBOW) {
     // 彩虹由中心向外流動：hue 變為流動速度，sat 與 val 維持
-    uint16_t cCol = hsvToRgb565((int)animRainbowPhase % 360, lightCfg.sat, lightCfg.val);
+    uint16_t cCol =
+        hsvToRgb565((int)animRainbowPhase % 360, lightCfg.sat, lightCfg.val);
     tft.drawPixel(rx, ry, cCol);
     for (int cr = 1; cr <= r - 1; cr++) {
       int ringHue = ((int)(animRainbowPhase - cr * 25.0f) % 360 + 360) % 360;
@@ -349,7 +361,8 @@ void drawLightPreviewCircle(int rx, int ry, int r) {
     tft.drawCircle(rx, ry, r, COLOR_WHITE);
   } else if (lightCfg.style == MODE_THUNDER) {
     // 雷電模式：隨機頻閃，最高亮度受 val 控制
-    uint16_t tCol = hsvToRgb565(lightCfg.hue, (lightCfg.sat * 2) / 3, thunderBrightness);
+    uint16_t tCol =
+        hsvToRgb565(lightCfg.hue, (lightCfg.sat * 2) / 3, thunderBrightness);
     tft.fillCircle(rx, ry, r - 1, tCol);
     tft.drawCircle(rx, ry, r, COLOR_WHITE);
   } else if (lightCfg.style == MODE_RAINING) {
@@ -398,18 +411,22 @@ void handleLightAnimation() {
 
   float rSpeed = (float)lightCfg.speed;
   animRainbowPhase += rSpeed * 1.8f * dt * 60.0f;
-  if (animRainbowPhase >= 360.0f) animRainbowPhase -= 360.0f;
+  if (animRainbowPhase >= 360.0f)
+    animRainbowPhase -= 360.0f;
 
   float bSpeed = (float)lightCfg.speed;
   animBreathePhase += bSpeed * 0.05f * dt * 60.0f;
-  if (animBreathePhase >= 6.283185f) animBreathePhase -= 6.283185f;
+  if (animBreathePhase >= 6.283185f)
+    animBreathePhase -= 6.283185f;
 
   updateThunderAnimation(now);
 
   float rainSpeed = (float)lightCfg.speed;
   rainAngle += rainSpeed * 2.5f * dt * 60.0f;
-  if (rainAngle >= 360.0f) rainAngle -= 360.0f;
-  if (rainAngle < 0.0f) rainAngle += 360.0f;
+  if (rainAngle >= 360.0f)
+    rainAngle -= 360.0f;
+  if (rainAngle < 0.0f)
+    rainAngle += 360.0f;
 
   updatePartyAnimation(now);
 
@@ -432,15 +449,21 @@ bool vl53l0xReady = false;
 int16_t tofDistanceMm = -1; // -1 表示感測器未就緒或超出測量範圍
 unsigned long lastTofSampleTime = 0;
 
-float sysTemp = 25.0; // 預設室溫初值，背景自動更新
-float sysVolt = 3.31;
-int sysCurr = 142;
+float sysTemp = 25.0;  // 預設室溫初值，背景自動更新
+float sysCurr1 = 0.0f; // 電流感測器 1 讀數 (ACS712 20A, GPIO 35)
+float sysCurr2 = 0.0f; // 電流感測器 2 讀數 (ACS712T-05B, GPIO 34)
+float zeroCurrentMv1 = CFG_ACS712_1_ZERO_MV; // 0A 基準電壓 1
+float zeroCurrentMv2 = CFG_ACS712_2_ZERO_MV; // 0A 基準電壓 2
+unsigned long lastCurrentSampleTime = 0;     // 電流採樣計時器
 
 // 非阻塞感測器取樣計時器
 unsigned long lastTempRequestTime = 0;
 bool tempConversionPending = false;
 unsigned long lastThermalAlarmTime = 0; // 超溫警報重複計時器
-unsigned long resetPressStartTime = 0;   // 四鍵長按計時器
+unsigned long resetPressStartTime = 0;  // 四鍵長按計時器
+unsigned long sleepPressStartTime = 0;  // 首頁長按 BACK 3 秒睡眠計時器
+unsigned long mutePressStartTime = 0;   // 長按左右雙鍵 1.5 秒靜音計時器
+bool muteToggleTriggered = false;       // 靜音切換觸發防連擊旗標
 
 int cursorRow = 0;
 bool isEditing = false;
@@ -505,8 +528,8 @@ void handleSerialInput() {
     } else {
       Serial.printf("[SIM INPUT] '%c' ignored.\n", raw);
     }
-    Serial.println(
-        "  >> Keys: [Q] Left/Up/-  [W] Right/Down/+  [E] ENTER  [R] BACK  [X] System Reset");
+    Serial.println("  >> Keys: [Q] Left/Up/-  [W] Right/Down/+  [E] ENTER  [R] "
+                   "BACK  [X] System Reset");
   }
 }
 
@@ -530,8 +553,10 @@ void scanButtons() {
     }
     btns[i].lastReading = reading;
 
-    // 長按連發檢測：按住超過 CFG_BUTTON_REPEAT_START_MS 後，每隔 CFG_BUTTON_REPEAT_RATE_MS 觸發一次 repeatTriggered
-    if (btns[i].stableState == LOW && !btns[i].justPressed && now > stateSwitchLockout) {
+    // 長按連發檢測：按住超過 CFG_BUTTON_REPEAT_START_MS 後，每隔
+    // CFG_BUTTON_REPEAT_RATE_MS 觸發一次 repeatTriggered
+    if (btns[i].stableState == LOW && !btns[i].justPressed &&
+        now > stateSwitchLockout) {
       if (now - btns[i].pressStartTime >= CFG_BUTTON_REPEAT_START_MS) {
         if (now - btns[i].lastRepeatTime >= CFG_BUTTON_REPEAT_RATE_MS) {
           btns[i].repeatTriggered = true;
@@ -614,8 +639,8 @@ void drawSideButtons() {
       // 分頁瀏覽狀態：左翼 UP，右翼 DOWN (依使用者操作反饋調整)
       int upX = (12 - ICON_UP_W) / 2;
       int upY = 58 - (ICON_UP_H / 2);
-      tft.drawBitmap(upX, upY, icon_up, ICON_UP_W, ICON_UP_H,
-                     COLOR_AMBER, COLOR_BG);
+      tft.drawBitmap(upX, upY, icon_up, ICON_UP_W, ICON_UP_H, COLOR_AMBER,
+                     COLOR_BG);
 
       int downX = 116 + (12 - ICON_DOWN_W) / 2;
       int downY = 58 - (ICON_DOWN_H / 2);
@@ -672,6 +697,11 @@ void drawTopBar() {
   tft.fillRect(17, 6, 2, 4, COLOR_CYAN);
   tft.fillRect(4, 6, 9, 4, COLOR_GREEN);
   drawTacticalString(22, 5, "85%", COLOR_CYAN, COLOR_BG, 1);
+
+  // 靜音圖標 (位於電池百分比與 WiFi 分隔線之間)
+  if (isMuted) {
+    tft.drawBitmap(42, 4, icon_mute_8x8, 8, 8, COLOR_AMBER, COLOR_BG);
+  }
 
   tft.drawFastVLine(52, 3, 10, COLOR_DARKGREY);
   tft.drawPixel(52, 8, COLOR_AMBER);
@@ -826,7 +856,8 @@ void playMotorEntranceAnim() {
 
   drawTacticalString(cx + 6, cy + 3, ">MOTOR", COLOR_AMBER, COLOR_BG, 1);
   if (tofDistanceMm >= 0) {
-    drawTacticalPrintf(cx + 52, cy + 3, COLOR_CYAN, COLOR_BG, 1, "%4dMM", tofDistanceMm);
+    drawTacticalPrintf(cx + 52, cy + 3, COLOR_CYAN, COLOR_BG, 1, "%4dMM",
+                       tofDistanceMm);
   } else {
     drawTacticalString(cx + 52, cy + 3, "--- MM", COLOR_DARKGREY, COLOR_BG, 1);
   }
@@ -899,15 +930,15 @@ void playSensorsEntranceAnim() {
   tft.drawLine(boxX, boxY, boxX, boxY + 10, COLOR_AMBER);
 
   int bY = cy + 49, bW = 39, bH = 26;
-  int vBoxX = cx + 8;
-  tft.drawRect(vBoxX, bY, bW, bH, COLOR_MIDGREY);
-  tft.fillRect(vBoxX + 1, bY + 1, bW - 2, 9, 0x11C5);
-  drawTacticalString(vBoxX + 4, bY + 2, "VOLT", COLOR_CYAN, 0x11C5, 1);
+  int c1BoxX = cx + 8;
+  tft.drawRect(c1BoxX, bY, bW, bH, COLOR_MIDGREY);
+  tft.fillRect(c1BoxX + 1, bY + 1, bW - 2, 9, 0x11C5);
+  drawTacticalString(c1BoxX + 4, bY + 2, "CUR1", COLOR_CYAN, 0x11C5, 1);
 
-  int cBoxX = cx + 51;
-  tft.drawRect(cBoxX, bY, bW, bH, COLOR_MIDGREY);
-  tft.fillRect(cBoxX + 1, bY + 1, bW - 2, 9, 0x11C5);
-  drawTacticalString(cBoxX + 4, bY + 2, "CURR", COLOR_AMBER, 0x11C5, 1);
+  int c2BoxX = cx + 51;
+  tft.drawRect(c2BoxX, bY, bW, bH, COLOR_MIDGREY);
+  tft.fillRect(c2BoxX + 1, bY + 1, bW - 2, 9, 0x11C5);
+  drawTacticalString(c2BoxX + 4, bY + 2, "CUR2", COLOR_AMBER, 0x11C5, 1);
   delay(40);
 
   const uint16_t *tempFrames[4] = {icon_T_low, icon_T_norm, icon_T_mid,
@@ -917,7 +948,8 @@ void playSensorsEntranceAnim() {
 
   // 循序展示低溫至高溫原圖色彩階梯動畫
   for (int f = 0; f < 4; f++) {
-    tft.drawRGBBitmap(iconX, iconY, tempFrames[f], ICON_T_HIGH_W, ICON_T_HIGH_H);
+    tft.drawRGBBitmap(iconX, iconY, tempFrames[f], ICON_T_HIGH_W,
+                      ICON_T_HIGH_H);
     delay(45);
   }
   // 動畫結束後恢復為當前溫度實際對應的原圖圖標
@@ -935,25 +967,27 @@ void playSensorsEntranceAnim() {
   snprintf(tempBuf, sizeof(tempBuf), "%2.1f", sysTemp);
   int tNumW = getTacticalStringWidth(tempBuf, 2);
   drawTacticalString(boxX + 4, boxY + 7, tempBuf, COLOR_WHITE, COLOR_BG, 2);
-  drawTacticalString(boxX + 4 + tNumW + 3, boxY + 6, "'C", COLOR_WHITE, COLOR_BG, 1);
+  drawTacticalString(boxX + 4 + tNumW + 3, boxY + 6, "'C", COLOR_WHITE,
+                     COLOR_BG, 1);
   delay(25);
 
   drawTacticalString(boxX + 4, boxY + 7, tempBuf, COLOR_AMBER, COLOR_BG, 2);
-  drawTacticalString(boxX + 4 + tNumW + 3, boxY + 6, "'C", COLOR_CYAN, COLOR_BG, 1);
+  drawTacticalString(boxX + 4 + tNumW + 3, boxY + 6, "'C", COLOR_CYAN, COLOR_BG,
+                     1);
   delay(35);
 
-  tft.fillRect(vBoxX + 1, bY + 11, bW - 2, 14, COLOR_CYAN);
+  tft.fillRect(c1BoxX + 1, bY + 11, bW - 2, 14, COLOR_CYAN);
   delay(15);
-  tft.fillRect(vBoxX + 1, bY + 11, bW - 2, 14, COLOR_BG);
-  drawTacticalPrintf(vBoxX + 4, bY + 14, COLOR_WHITE, COLOR_BG, 1, "%1.2fV",
-                     sysVolt);
+  tft.fillRect(c1BoxX + 1, bY + 11, bW - 2, 14, COLOR_BG);
+  drawTacticalPrintf(c1BoxX + 4, bY + 14, COLOR_WHITE, COLOR_BG, 1, "%2.2fA",
+                     sysCurr1);
   delay(35);
 
-  tft.fillRect(cBoxX + 1, bY + 11, bW - 2, 14, COLOR_AMBER);
+  tft.fillRect(c2BoxX + 1, bY + 11, bW - 2, 14, COLOR_AMBER);
   delay(15);
-  tft.fillRect(cBoxX + 1, bY + 11, bW - 2, 14, COLOR_BG);
-  drawTacticalPrintf(cBoxX + 4, bY + 14, COLOR_WHITE, COLOR_BG, 1, "%3dMA",
-                     sysCurr);
+  tft.fillRect(c2BoxX + 1, bY + 11, bW - 2, 14, COLOR_BG);
+  drawTacticalPrintf(c2BoxX + 4, bY + 14, COLOR_WHITE, COLOR_BG, 1, "%2.2fA",
+                     sysCurr2);
 }
 
 void playPageEntranceAnimation(int pageIdx) {
@@ -972,11 +1006,14 @@ void drawCentralCardContent() {
   if (carouselIndex == PAGE_LIGHT) {
     drawTacticalString(cx + 6, cy + 3, ">LIGHT", COLOR_AMBER, COLOR_BG, 1);
     if (lightCfg.style == MODE_RAINBOW) {
-      drawTacticalPrintf(cx + 60, cy + 3, COLOR_LIGHTGREY, COLOR_BG, 1, "S:%3d", lightCfg.speed);
+      drawTacticalPrintf(cx + 60, cy + 3, COLOR_LIGHTGREY, COLOR_BG, 1, "S:%3d",
+                         lightCfg.speed);
     } else if (lightCfg.style == MODE_PARTY) {
-      drawTacticalPrintf(cx + 60, cy + 3, COLOR_LIGHTGREY, COLOR_BG, 1, "B:%3d", lightCfg.val);
+      drawTacticalPrintf(cx + 60, cy + 3, COLOR_LIGHTGREY, COLOR_BG, 1, "B:%3d",
+                         lightCfg.val);
     } else {
-      drawTacticalPrintf(cx + 66, cy + 3, COLOR_LIGHTGREY, COLOR_BG, 1, "%3d'", lightCfg.hue);
+      drawTacticalPrintf(cx + 66, cy + 3, COLOR_LIGHTGREY, COLOR_BG, 1, "%3d'",
+                         lightCfg.hue);
     }
 
     int barX = cx + 8, barY = cy + 14, barW = 82, barH = 5;
@@ -1019,9 +1056,11 @@ void drawCentralCardContent() {
   } else if (carouselIndex == PAGE_MOTOR) {
     drawTacticalString(cx + 6, cy + 3, ">MOTOR", COLOR_AMBER, COLOR_BG, 1);
     if (tofDistanceMm >= 0) {
-      drawTacticalPrintf(cx + 52, cy + 3, COLOR_CYAN, COLOR_BG, 1, "%4dMM", tofDistanceMm);
+      drawTacticalPrintf(cx + 52, cy + 3, COLOR_CYAN, COLOR_BG, 1, "%4dMM",
+                         tofDistanceMm);
     } else {
-      drawTacticalString(cx + 52, cy + 3, "--- MM", COLOR_DARKGREY, COLOR_BG, 1);
+      drawTacticalString(cx + 52, cy + 3, "--- MM", COLOR_DARKGREY, COLOR_BG,
+                         1);
     }
 
     int dialX = 63, dialY = 56;
@@ -1056,7 +1095,8 @@ void drawCentralCardContent() {
     snprintf(tempBuf, sizeof(tempBuf), "%2.1f", sysTemp);
     int tNumW = getTacticalStringWidth(tempBuf, 2);
     drawTacticalString(boxX + 4, boxY + 7, tempBuf, COLOR_AMBER, COLOR_BG, 2);
-    drawTacticalString(boxX + 4 + tNumW + 3, boxY + 6, "'C", COLOR_CYAN, COLOR_BG, 1);
+    drawTacticalString(boxX + 4 + tNumW + 3, boxY + 6, "'C", COLOR_CYAN,
+                       COLOR_BG, 1);
 
     int iconX = boxX + boxW - ICON_T_HIGH_W - 5;
     int iconY = boxY + (boxH - ICON_T_HIGH_H) / 2;
@@ -1064,19 +1104,19 @@ void drawCentralCardContent() {
                       ICON_T_HIGH_H);
 
     int bY = cy + 49, bW = 39, bH = 26;
-    int vBoxX = cx + 8;
-    tft.drawRect(vBoxX, bY, bW, bH, COLOR_MIDGREY);
-    tft.fillRect(vBoxX + 1, bY + 1, bW - 2, 9, 0x11C5);
-    drawTacticalString(vBoxX + 4, bY + 2, "VOLT", COLOR_CYAN, 0x11C5, 1);
-    drawTacticalPrintf(vBoxX + 4, bY + 14, COLOR_WHITE, COLOR_BG, 1, "%1.2fV",
-                       sysVolt);
+    int c1BoxX = cx + 8;
+    tft.drawRect(c1BoxX, bY, bW, bH, COLOR_MIDGREY);
+    tft.fillRect(c1BoxX + 1, bY + 1, bW - 2, 9, 0x11C5);
+    drawTacticalString(c1BoxX + 4, bY + 2, "CUR1", COLOR_CYAN, 0x11C5, 1);
+    drawTacticalPrintf(c1BoxX + 4, bY + 14, COLOR_WHITE, COLOR_BG, 1, "%2.2fA",
+                       sysCurr1);
 
-    int cBoxX = cx + 51;
-    tft.drawRect(cBoxX, bY, bW, bH, COLOR_MIDGREY);
-    tft.fillRect(cBoxX + 1, bY + 1, bW - 2, 9, 0x11C5);
-    drawTacticalString(cBoxX + 4, bY + 2, "CURR", COLOR_AMBER, 0x11C5, 1);
-    drawTacticalPrintf(cBoxX + 4, bY + 14, COLOR_WHITE, COLOR_BG, 1, "%3dMA",
-                       sysCurr);
+    int c2BoxX = cx + 51;
+    tft.drawRect(c2BoxX, bY, bW, bH, COLOR_MIDGREY);
+    tft.fillRect(c2BoxX + 1, bY + 1, bW - 2, 9, 0x11C5);
+    drawTacticalString(c2BoxX + 4, bY + 2, "CUR2", COLOR_AMBER, 0x11C5, 1);
+    drawTacticalPrintf(c2BoxX + 4, bY + 14, COLOR_WHITE, COLOR_BG, 1, "%2.2fA",
+                       sysCurr2);
   }
 }
 
@@ -1105,7 +1145,8 @@ void playCyberTransition(bool toRight) {
 }
 
 bool isLightRowSelectable(int row) {
-  if (carouselIndex != PAGE_LIGHT) return true;
+  if (carouselIndex != PAGE_LIGHT)
+    return true;
   if (row == 0) {
     if (lightCfg.style == MODE_RAINBOW || lightCfg.style == MODE_PARTY) {
       return false; // 灰底停用項目，導航自動跳過
@@ -1127,7 +1168,8 @@ void updateLightRow(int row) {
   drawTacticalChar(14, y + 2, sel ? (isEditing ? '#' : '>') : ' ',
                    isEditing ? COLOR_AMBER : COLOR_CYAN, COLOR_BG, 1);
 
-  // 2. 動態標籤文字 (僅 STATIC 模式第 4 行為 CLR，其餘動態模式第 4 行統一為 SPD 特效速度)
+  // 2. 動態標籤文字 (僅 STATIC 模式第 4 行為 CLR，其餘動態模式第 4 行統一為 SPD
+  // 特效速度)
   const char *tag = "---";
   if (row == 0) {
     tag = "HUE";
@@ -1141,9 +1183,11 @@ void updateLightRow(int row) {
     tag = (lightCfg.style == MODE_STATIC) ? "CLR" : "SPD";
   }
 
-  uint16_t tagCol = sel ? (isEditing ? COLOR_AMBER : COLOR_WHITE) : COLOR_LIGHTGREY;
+  uint16_t tagCol =
+      sel ? (isEditing ? COLOR_AMBER : COLOR_WHITE) : COLOR_LIGHTGREY;
   // RAINBOW 與 PARTY 模式下 HUE 被忽略，顯示為暗灰色以提示停用
-  if ((lightCfg.style == MODE_RAINBOW || lightCfg.style == MODE_PARTY) && row == 0) {
+  if ((lightCfg.style == MODE_RAINBOW || lightCfg.style == MODE_PARTY) &&
+      row == 0) {
     tagCol = COLOR_DARKGREY;
   }
   // PARTY 模式下 SAT 也被忽略
@@ -1161,7 +1205,8 @@ void updateLightRow(int row) {
       drawTacticalString(88, y + 2, "---", COLOR_DARKGREY, COLOR_BG, 1);
     } else {
       drawHsvTrueColorBar(44, y + 1, 40, 9, 0, lightCfg.hue, 359, sel);
-      drawTacticalPrintf(88, y + 2, COLOR_LIGHTGREY, COLOR_BG, 1, "%3d", lightCfg.hue);
+      drawTacticalPrintf(88, y + 2, COLOR_LIGHTGREY, COLOR_BG, 1, "%3d",
+                         lightCfg.hue);
     }
   } else if (row == 1) {
     if (lightCfg.style == MODE_PARTY) {
@@ -1171,32 +1216,39 @@ void updateLightRow(int row) {
       drawTacticalString(88, y + 2, "---", COLOR_DARKGREY, COLOR_BG, 1);
     } else {
       drawHsvTrueColorBar(44, y + 1, 40, 9, 1, lightCfg.sat, 100, sel);
-      drawTacticalPrintf(88, y + 2, COLOR_LIGHTGREY, COLOR_BG, 1, "%3d", lightCfg.sat);
+      drawTacticalPrintf(88, y + 2, COLOR_LIGHTGREY, COLOR_BG, 1, "%3d",
+                         lightCfg.sat);
     }
   } else if (row == 2) {
     // BRI: 所有模式均受亮度控制 (守護最高亮度)
     drawHsvTrueColorBar(44, y + 1, 40, 9, 2, lightCfg.val, 100, sel);
-    drawTacticalPrintf(88, y + 2, COLOR_LIGHTGREY, COLOR_BG, 1, "%3d", lightCfg.val);
+    drawTacticalPrintf(88, y + 2, COLOR_LIGHTGREY, COLOR_BG, 1, "%3d",
+                       lightCfg.val);
   } else if (row == 3) {
-    uint16_t boxBorder = (sel && isEditing) ? COLOR_AMBER : (sel ? COLOR_CYAN : COLOR_MIDGREY);
+    uint16_t boxBorder =
+        (sel && isEditing) ? COLOR_AMBER : (sel ? COLOR_CYAN : COLOR_MIDGREY);
     tft.drawRect(44, y + 1, 68, 11, boxBorder);
     uint16_t boxBg = (sel && isEditing) ? 0x2104 : COLOR_BG;
     tft.fillRect(45, y + 2, 66, 9, boxBg);
 
     char mBuf[20];
     snprintf(mBuf, sizeof(mBuf), "[%s]", LIGHT_MODE_NAMES[lightCfg.style]);
-    uint16_t mCol = (sel && isEditing) ? COLOR_AMBER : (sel ? COLOR_WHITE : COLOR_CYAN);
+    uint16_t mCol =
+        (sel && isEditing) ? COLOR_AMBER : (sel ? COLOR_WHITE : COLOR_CYAN);
     int mW = getTacticalStringWidth(mBuf, 1);
     drawTacticalString(44 + (68 - mW) / 2, y + 2, mBuf, mCol, boxBg, 1);
   } else if (row == 4) {
     if (lightCfg.style == MODE_STATIC) {
       uint16_t curCol = hsvToRgb565(lightCfg.hue, lightCfg.sat, lightCfg.val);
       tft.fillRect(44, y + 1, 40, 9, curCol);
-      tft.drawRect(44, y + 1, 40, 9, sel ? (isEditing ? COLOR_AMBER : COLOR_CYAN) : COLOR_WHITE);
+      tft.drawRect(44, y + 1, 40, 9,
+                   sel ? (isEditing ? COLOR_AMBER : COLOR_CYAN) : COLOR_WHITE);
       drawTacticalString(88, y + 2, "VIEW", COLOR_LIGHTGREY, COLOR_BG, 1);
     } else if (lightCfg.style == MODE_RAINING) {
       // 雨滴滑行速度：支援負值 (-50 ~ +50) 雙向能量條
-      tft.drawRect(44, y + 1, 40, 9, sel ? (isEditing ? COLOR_AMBER : COLOR_CYAN) : COLOR_MIDGREY);
+      tft.drawRect(44, y + 1, 40, 9,
+                   sel ? (isEditing ? COLOR_AMBER : COLOR_CYAN)
+                       : COLOR_MIDGREY);
       tft.fillRect(45, y + 2, 38, 7, COLOR_BG);
       tft.drawFastVLine(63, y + 2, 7, COLOR_MIDGREY); // 中心 0 刻度
       if (lightCfg.speed > 0) {
@@ -1211,8 +1263,10 @@ void updateLightRow(int row) {
       drawTacticalString(88, y + 2, spdBuf, COLOR_LIGHTGREY, COLOR_BG, 1);
     } else {
       // RAINBOW, BREATHE, THUNDER, PARTY: 特效速度 SPD (1 ~ 100)
-      drawTechBar(44, y + 1, 40, 9, lightCfg.speed, 100, sel ? (isEditing ? COLOR_AMBER : COLOR_CYAN) : COLOR_AMBER);
-      drawTacticalPrintf(88, y + 2, COLOR_LIGHTGREY, COLOR_BG, 1, "%3d", lightCfg.speed);
+      drawTechBar(44, y + 1, 40, 9, lightCfg.speed, 100,
+                  sel ? (isEditing ? COLOR_AMBER : COLOR_CYAN) : COLOR_AMBER);
+      drawTacticalPrintf(88, y + 2, COLOR_LIGHTGREY, COLOR_BG, 1, "%3d",
+                         lightCfg.speed);
     }
   }
 }
@@ -1222,8 +1276,10 @@ void updateMotorSubpage() {
   int yTof = 22;
   drawTacticalString(16, yTof, "DIST // TOF", COLOR_LIGHTGREY, COLOR_BG, 1);
   if (tofDistanceMm >= 0) {
-    drawTacticalPrintf(80, yTof, COLOR_CYAN, COLOR_BG, 1, "%4dMM", tofDistanceMm);
-    drawTechBar(16, yTof + 11, 96, 7, constrain((int)tofDistanceMm, 0, 1200), 1200, COLOR_CYAN);
+    drawTacticalPrintf(80, yTof, COLOR_CYAN, COLOR_BG, 1, "%4dMM",
+                       tofDistanceMm);
+    drawTechBar(16, yTof + 11, 96, 7, constrain((int)tofDistanceMm, 0, 1200),
+                1200, COLOR_CYAN);
   } else {
     drawTacticalString(80, yTof, "--- MM", COLOR_DARKGREY, COLOR_BG, 1);
     drawTechBar(16, yTof + 11, 96, 7, 0, 1200, COLOR_DARKGREY);
@@ -1232,7 +1288,8 @@ void updateMotorSubpage() {
   // 2. 馬達速度 Velocity 設定區
   int yMot = 48;
   uint16_t titleCol = isEditing ? COLOR_AMBER : COLOR_CYAN;
-  drawTacticalString(16, yMot, isEditing ? "# VELOCITY" : "> VELOCITY", titleCol, COLOR_BG, 1);
+  drawTacticalString(16, yMot, isEditing ? "# VELOCITY" : "> VELOCITY",
+                     titleCol, COLOR_BG, 1);
   drawTacticalPrintf(84, yMot, titleCol, COLOR_BG, 1, "%3d%%", motorCfg.speed);
 
   uint16_t bCol = isEditing ? COLOR_AMBER : COLOR_CYAN;
@@ -1243,7 +1300,8 @@ void updateMotorSubpage() {
   char rpmBuf[24];
   snprintf(rpmBuf, sizeof(rpmBuf), "VEL %4d RPM", rpm);
   int rpmW = getTacticalStringWidth(rpmBuf, 1);
-  drawTacticalString(16 + (96 - rpmW) / 2, yMot + 31, rpmBuf, COLOR_LIGHTGREY, COLOR_BG, 1);
+  drawTacticalString(16 + (96 - rpmW) / 2, yMot + 31, rpmBuf, COLOR_LIGHTGREY,
+                     COLOR_BG, 1);
 }
 
 void updateSensorsSubpage() {
@@ -1251,26 +1309,32 @@ void updateSensorsSubpage() {
                      sysTemp);
   drawTechBar(16, 36, 96, 7, (int)sysTemp, 80, COLOR_AMBER);
 
-  drawTacticalPrintf(16, 50, COLOR_LIGHTGREY, COLOR_BG, 1, "BUS VOLT: %1.2fV",
-                     sysVolt);
-  drawTechBar(16, 62, 96, 7, (int)(sysVolt * 10), 50, COLOR_GREEN);
+  drawTacticalPrintf(16, 50, COLOR_LIGHTGREY, COLOR_BG, 1, "CURR 1  : %2.2fA",
+                     sysCurr1);
+  drawTechBar(16, 62, 96, 7, (int)(sysCurr1 * 10), 200, COLOR_CYAN);
 
-  drawTacticalPrintf(16, 76, COLOR_LIGHTGREY, COLOR_BG, 1, "TOT CURR: %3dMA",
-                     sysCurr);
-  drawTechBar(16, 88, 96, 7, sysCurr, 300, COLOR_CYAN);
+  drawTacticalPrintf(16, 76, COLOR_LIGHTGREY, COLOR_BG, 1, "CURR 2  : %2.2fA",
+                     sysCurr2);
+  drawTechBar(16, 88, 96, 7, (int)(sysCurr2 * 10), 50, COLOR_AMBER);
 }
 
 const char *getSubpageTitle() {
-  if (carouselIndex == PAGE_LIGHT)   return "LIGHT";
-  if (carouselIndex == PAGE_MOTOR)   return "MOTOR";
-  if (carouselIndex == PAGE_SENSORS) return "THERMAL";
+  if (carouselIndex == PAGE_LIGHT)
+    return "LIGHT";
+  if (carouselIndex == PAGE_MOTOR)
+    return "MOTOR";
+  if (carouselIndex == PAGE_SENSORS)
+    return "THERMAL";
   return "";
 }
 
 const char *getHomeCardTitle() {
-  if (carouselIndex == PAGE_LIGHT)   return ">LIGHT";
-  if (carouselIndex == PAGE_MOTOR)   return ">MOTOR";
-  if (carouselIndex == PAGE_SENSORS) return ">THERMAL";
+  if (carouselIndex == PAGE_LIGHT)
+    return ">LIGHT";
+  if (carouselIndex == PAGE_MOTOR)
+    return ">MOTOR";
+  if (carouselIndex == PAGE_SENSORS)
+    return ">THERMAL";
   return "";
 }
 
@@ -1324,7 +1388,8 @@ void playSubpageEnterTransition() {
     }
 
     // 滑動過程中由 >LIGHT 過渡為純大標 LIGHT
-    drawTacticalString(curX, curY, (i >= 3) ? subTitle : homeTitle, COLOR_AMBER, COLOR_BG, 1);
+    drawTacticalString(curX, curY, (i >= 3) ? subTitle : homeTitle, COLOR_AMBER,
+                       COLOR_BG, 1);
     delay(8);
   }
 
@@ -1371,7 +1436,8 @@ void playSubpageExitTransition() {
     int prevY = map(i - 1, 0, steps, startY, targetY);
 
     tft.fillRect(0, prevY, 128, 10, COLOR_BG);
-    drawTacticalString(curX, curY, (i <= 2) ? subTitle : homeTitle, COLOR_AMBER, COLOR_BG, 1);
+    drawTacticalString(curX, curY, (i <= 2) ? subTitle : homeTitle, COLOR_AMBER,
+                       COLOR_BG, 1);
     delay(8);
   }
 
@@ -1409,8 +1475,93 @@ void drawSubpageScreen(bool animate = false) {
   updateGlobalButtonBar();
 }
 
+// ==========================================================
+// 電源管理與 NVS 偏好設定 (Power Management & Preferences)
+// ==========================================================
+
+bool isAnyButtonPressed() {
+  return (digitalRead(PIN_KEY_A) == LOW || digitalRead(PIN_KEY_B) == LOW ||
+          digitalRead(PIN_KEY_C) == LOW || digitalRead(PIN_KEY_D) == LOW);
+}
+
+void loadPreferences() {
+  lightCfg.style = preferences.getUChar("light_style", MODE_STATIC);
+  if (lightCfg.style >= TOTAL_LIGHT_MODES)
+    lightCfg.style = MODE_STATIC;
+
+  lightCfg.hue = preferences.getUShort("light_hue", CFG_DEFAULT_HUE);
+  if (lightCfg.hue >= 360)
+    lightCfg.hue = CFG_DEFAULT_HUE;
+
+  lightCfg.sat = preferences.getUChar("light_sat", CFG_DEFAULT_SAT);
+  if (lightCfg.sat > 100)
+    lightCfg.sat = CFG_DEFAULT_SAT;
+
+  lightCfg.val = preferences.getUChar("light_val", CFG_DEFAULT_VAL);
+  if (lightCfg.val > 100)
+    lightCfg.val = CFG_DEFAULT_VAL;
+
+  lightCfg.speed = preferences.getChar("light_spd", CFG_DEFAULT_LIGHT_SPEED);
+  if (lightCfg.speed < -50 || lightCfg.speed > 100)
+    lightCfg.speed = CFG_DEFAULT_LIGHT_SPEED;
+
+  motorCfg.speed = preferences.getUChar("motor_spd", CFG_DEFAULT_MOTOR_SPEED);
+  if (motorCfg.speed > 100)
+    motorCfg.speed = CFG_DEFAULT_MOTOR_SPEED;
+
+  isMuted = preferences.getBool("is_muted", false);
+
+  lightBackup = lightCfg;
+  motorBackup = motorCfg;
+}
+
+void savePreferences(bool setSleepFlag) {
+  preferences.putBool("is_sleep", setSleepFlag);
+  preferences.putUChar("light_style", lightCfg.style);
+  preferences.putUShort("light_hue", lightCfg.hue);
+  preferences.putUChar("light_sat", lightCfg.sat);
+  preferences.putUChar("light_val", lightCfg.val);
+  preferences.putChar("light_spd", lightCfg.speed);
+  preferences.putUChar("motor_spd", motorCfg.speed);
+  preferences.putBool("is_muted", isMuted);
+}
+
+void enterDeepSleep(bool saveToPrefs = true) {
+  if (saveToPrefs) {
+    sfxPowerOff();
+    savePreferences(true);
+  }
+
+  // 關閉螢幕背光/畫面 (全黑)
+  tft.fillScreen(COLOR_BG);
+
+  // 蜂鳴器確保靜音
+  ledcWriteTone(BUZZER_PIN, 0);
+  digitalWrite(BUZZER_PIN, HIGH);
+
+  // 保持 RTC 外設電源開啟以維持內部上拉
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+  rtc_gpio_pullup_en((gpio_num_t)PIN_KEY_A);
+  rtc_gpio_pulldown_dis((gpio_num_t)PIN_KEY_A);
+  rtc_gpio_pullup_en((gpio_num_t)PIN_KEY_B);
+  rtc_gpio_pulldown_dis((gpio_num_t)PIN_KEY_B);
+  rtc_gpio_pullup_en((gpio_num_t)PIN_KEY_C);
+  rtc_gpio_pulldown_dis((gpio_num_t)PIN_KEY_C);
+  rtc_gpio_pullup_en((gpio_num_t)PIN_KEY_D);
+  rtc_gpio_pulldown_dis((gpio_num_t)PIN_KEY_D);
+
+  // EXT0 喚醒：BACK (Button D, GPIO 27) 立即喚醒
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_KEY_D, 0);
+  // 定時器定週期 (50ms) 喚醒檢測其餘按鍵 (Button A, B, C)
+  esp_sleep_enable_timer_wakeup(50ULL * 1000ULL);
+
+  // 進入深度睡眠
+  esp_deep_sleep_start();
+}
+
 void triggerSystemReset() {
-  Serial.println("\n[SYSTEM] === 4-BUTTON SIMULTANEOUS PRESS DETECTED: HARDWARE SYSTEM RESET ===");
+  Serial.println("\n[SYSTEM] === 4-BUTTON SIMULTANEOUS PRESS DETECTED: "
+                 "HARDWARE SYSTEM RESET ===");
 
   // 1. 硬體級別重置 TFT 螢幕 (拉低 TFT_RST 重啟 LCD 控制器，修復短路白屏)
   if (TFT_RST >= 0) {
@@ -1460,6 +1611,10 @@ void triggerSystemReset() {
   motorBackup = motorCfg;
   tofDistanceMm = -1;
 
+  // 儲存重設後的預設值至 Preferences 並解除靜音
+  isMuted = false;
+  savePreferences(false);
+
   // 5. 重置狀態機
   currentState = STATE_HOME;
   carouselIndex = PAGE_LIGHT;
@@ -1497,11 +1652,94 @@ void renderFullHomeScreen() {
   updateGlobalButtonBar();
 }
 
+void calibrateAcs712Zeros() {
+  if (!CFG_ACS712_AUTO_ZERO)
+    return;
+
+  Serial.println(F("[ACS712] Calibrating 0A Quiescent Baseline..."));
+
+  // 預先讀取以穩定 ADC 內部取樣電容
+  for (int i = 0; i < 20; i++) {
+    analogReadMilliVolts(PIN_CURRENT_ACS712_1);
+    delay(2);
+    analogReadMilliVolts(PIN_CURRENT_ACS712_2);
+    delay(2);
+  }
+
+  uint32_t sum1 = 0, sum2 = 0;
+  const int TARE_SAMPLES = 80;
+  for (int i = 0; i < TARE_SAMPLES; i++) {
+    sum1 += analogReadMilliVolts(PIN_CURRENT_ACS712_1);
+    delayMicroseconds(50);
+    sum2 += analogReadMilliVolts(PIN_CURRENT_ACS712_2);
+    delayMicroseconds(50);
+  }
+
+  float avg1 = ((float)sum1 / TARE_SAMPLES) * CFG_ACS712_1_DIVIDER_RATIO;
+  float avg2 = ((float)sum2 / TARE_SAMPLES) * CFG_ACS712_2_DIVIDER_RATIO;
+
+  // 驗證讀數是否在合理範圍 (500mV ~ 3100mV) 避免接線斷路時誤歸零
+  if (avg1 >= 500.0f && avg1 <= 3100.0f) {
+    zeroCurrentMv1 = avg1;
+  }
+  if (avg2 >= 500.0f && avg2 <= 3100.0f) {
+    zeroCurrentMv2 = avg2;
+  }
+
+  Serial.printf("[ACS712] Calibrated Zero 1 (GPIO 35): %1.1f mV\n",
+                zeroCurrentMv1);
+  Serial.printf("[ACS712] Calibrated Zero 2 (GPIO 34): %1.1f mV\n",
+                zeroCurrentMv2);
+}
+
 void setup() {
+  // 1. 初始化所有戰術按鍵引腳為內部上拉輸入
+  for (int i = 0; i < 4; i++) {
+    pinMode(btns[i].pin, INPUT_PULLUP);
+  }
+
+  // 2. 開啟 Preferences NVS 偏好設定儲存空間
+  preferences.begin("wing_sys", false);
+
+  // 3. 檢查系統先前是否被手動置入待機深度睡眠
+  bool wasSleep = preferences.getBool("is_sleep", false);
+
+  if (wasSleep) {
+    // 處於待機沉睡狀態：唯有長按任意鍵持續 2 秒 (CFG_WAKE_HOLD_MS)
+    // 才喚醒進入活躍模式
+    bool isHeldFor2Sec = false;
+    unsigned long pressStart = millis();
+
+    while (isAnyButtonPressed()) {
+      if (millis() - pressStart >= CFG_WAKE_HOLD_MS) {
+        isHeldFor2Sec = true;
+        break;
+      }
+      delay(10);
+    }
+
+    if (isHeldFor2Sec) {
+      // 成功長按 2 秒：解除待機睡眠狀態
+      preferences.putBool("is_sleep", false);
+      // 等待使用者放開按鍵，避免開機後立即誤觸選單
+      while (isAnyButtonPressed()) {
+        delay(10);
+      }
+    } else {
+      // 任意按鍵未按住滿 2
+      // 秒（包含插拔電冷開機、誤碰、定時器週期喚醒）：立即重回待機睡眠，不開啟螢幕與外設
+      enterDeepSleep(false);
+      return;
+    }
+  }
+
+  // 4. 載入保存的各項參數 (若為意外斷電重開，自動回復上一次的參數)
+  loadPreferences();
+
   Serial.begin(115200);
-  delay(200);
+  delay(100);
   Serial.println("\n==============================================");
-  Serial.println("  WING UI - ESP32 NodeMCU-32S Tactical HUD    ");
+  Serial.println("  WING UI - ESP32 Tactical HUD (Active Mode)  ");
   Serial.println("==============================================");
   Serial.println(
       "Display: ST7735 1.44\" (CS:5, DC:22, RES:EN, SCK:18, MOSI:23)");
@@ -1511,10 +1749,6 @@ void setup() {
   Serial.println("  [E] : ENTER (Confirm)      -> Button A");
   Serial.println("  [R] : BACK  (Return)       -> Button D");
   Serial.println("==============================================\n");
-
-  for (int i = 0; i < 4; i++) {
-    pinMode(btns[i].pin, INPUT_PULLUP);
-  }
 
   SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
   tft.initR(INITR_144GREENTAB);
@@ -1541,6 +1775,16 @@ void setup() {
     Serial.println(F("[SENSOR] VL53L0X ToF Init Failed / Not Detected!"));
   }
 
+  // 初始化 ACS712 電流感測器輸入 (CURR 1: GPIO 35 [20A], CURR 2: GPIO 34 [05B
+  // 5A])
+  pinMode(PIN_CURRENT_ACS712_1, INPUT);
+  analogSetPinAttenuation(PIN_CURRENT_ACS712_1, ADC_11db);
+  pinMode(PIN_CURRENT_ACS712_2, INPUT);
+  analogSetPinAttenuation(PIN_CURRENT_ACS712_2, ADC_11db);
+
+  // 執行 ACS712 零電流基準校準 (Tare)
+  calibrateAcs712Zeros();
+
   // 初始化蜂鳴器音效引擎並播放開機未來戰術音
   sfxInit();
   sfxPowerOn();
@@ -1563,7 +1807,8 @@ void handleTemperatureSampling() {
         if (currentState == STATE_SUBPAGE && carouselIndex == PAGE_SENSORS) {
           drawSubpageTopBar();
           updateSensorsSubpage();
-        } else if (currentState == STATE_HOME && carouselIndex == PAGE_SENSORS) {
+        } else if (currentState == STATE_HOME &&
+                   carouselIndex == PAGE_SENSORS) {
           drawCentralCardContent();
         }
       }
@@ -1572,13 +1817,15 @@ void handleTemperatureSampling() {
     lastTempRequestTime = now;
   }
   // 每隔 CFG_TEMP_SAMPLE_INTERVAL_MS 發起一次新的溫度轉換請求
-  else if (!tempConversionPending && (now - lastTempRequestTime >= CFG_TEMP_SAMPLE_INTERVAL_MS)) {
+  else if (!tempConversionPending &&
+           (now - lastTempRequestTime >= CFG_TEMP_SAMPLE_INTERVAL_MS)) {
     tempSensor.requestTemperatures();
     lastTempRequestTime = now;
     tempConversionPending = true;
   }
 
-  // 超溫警報音效循環：若當前溫度超過門檻，每隔 CFG_TEMP_ALARM_INTERVAL_MS 重複播放警告音效
+  // 超溫警報音效循環：若當前溫度超過門檻，每隔 CFG_TEMP_ALARM_INTERVAL_MS
+  // 重複播放警告音效
   if (sysTemp >= CFG_TEMP_WARNING_THRESHOLD) {
     if (now - lastThermalAlarmTime >= CFG_TEMP_ALARM_INTERVAL_MS) {
       sfxWarning();
@@ -1615,9 +1862,98 @@ void handleTofSampling() {
       // 僅即時更新右上角測距文字，避免重畫中央錶盤造成微抖動
       int cx = 14, cy = 19;
       if (tofDistanceMm >= 0) {
-        drawTacticalPrintf(cx + 52, cy + 3, COLOR_CYAN, COLOR_BG, 1, "%4dMM", tofDistanceMm);
+        drawTacticalPrintf(cx + 52, cy + 3, COLOR_CYAN, COLOR_BG, 1, "%4dMM",
+                           tofDistanceMm);
       } else {
-        drawTacticalString(cx + 52, cy + 3, "--- MM", COLOR_DARKGREY, COLOR_BG, 1);
+        drawTacticalString(cx + 52, cy + 3, "--- MM", COLOR_DARKGREY, COLOR_BG,
+                           1);
+      }
+    }
+  }
+}
+
+// 讀取 ACS712 電流感測器輸出 (轉換為安培 A)
+float readAcs712Amps(uint8_t pin, float zeroMv, float sensitivity,
+                     float dividerRatio) {
+  // 切換通道時先執行一次讀取以釋放/充放內部取樣電容，徹底消除多通道串擾
+  analogReadMilliVolts(pin);
+  delayMicroseconds(30);
+
+  uint32_t sumMv = 0;
+  const int SAMPLES = 64;
+  for (int i = 0; i < SAMPLES; i++) {
+    sumMv += analogReadMilliVolts(pin);
+    delayMicroseconds(10);
+  }
+  float pinMv = (float)sumMv / SAMPLES;
+  float sensorMv = pinMv * dividerRatio;
+  float amps = fabs(sensorMv - zeroMv) / sensitivity;
+
+  // 0A 附近微小 ADC 雜訊過濾
+  if (amps < 0.06f) {
+    amps = 0.0f;
+  }
+  return amps;
+}
+
+void handleCurrentSampling() {
+  unsigned long now = millis();
+  if (now - lastCurrentSampleTime < CFG_CURRENT_SAMPLE_INTERVAL_MS)
+    return;
+  lastCurrentSampleTime = now;
+
+  // 採樣感測器 1 (ACS712-20A, GPIO 35) 與感測器 2 (ACS712T-05B, GPIO 34)
+  float rawCurr1 = readAcs712Amps(PIN_CURRENT_ACS712_1, zeroCurrentMv1,
+                                  CFG_ACS712_1_SENSITIVITY_MV_PER_A,
+                                  CFG_ACS712_1_DIVIDER_RATIO);
+  float rawCurr2 = readAcs712Amps(PIN_CURRENT_ACS712_2, zeroCurrentMv2,
+                                  CFG_ACS712_2_SENSITIVITY_MV_PER_A,
+                                  CFG_ACS712_2_DIVIDER_RATIO);
+
+  // 低通濾波穩定讀數 (70% 舊值 + 30% 新值)
+  float filt1 = (sysCurr1 * 0.7f) + (rawCurr1 * 0.3f);
+  if (filt1 < 0.04f)
+    filt1 = 0.0f;
+
+  float filt2 = (sysCurr2 * 0.7f) + (rawCurr2 * 0.3f);
+  if (filt2 < 0.03f)
+    filt2 = 0.0f;
+
+  bool c1Changed = (fabs(filt1 - sysCurr1) >= 0.03f);
+  bool c2Changed = (fabs(filt2 - sysCurr2) >= 0.02f);
+
+  if (c1Changed)
+    sysCurr1 = filt1;
+  if (c2Changed)
+    sysCurr2 = filt2;
+
+  // 定期輸出 Serial 監控數值 (方便實測觀察毫伏與安培數)
+  static unsigned long lastCurrLogTime = 0;
+  if (now - lastCurrLogTime >= 1500) {
+    lastCurrLogTime = now;
+    Serial.printf("[CURR] C1 (20A, GPIO35): %2.2fA (Zero: %1.0fmV) | C2 (05B, "
+                  "GPIO34): %2.2fA (Zero: %1.0fmV)\n",
+                  sysCurr1, zeroCurrentMv1, sysCurr2, zeroCurrentMv2);
+  }
+
+  if (c1Changed || c2Changed) {
+    if (currentState == STATE_SUBPAGE && carouselIndex == PAGE_SENSORS) {
+      updateSensorsSubpage();
+    } else if (currentState == STATE_HOME && carouselIndex == PAGE_SENSORS) {
+      int cx = 14, cy = 19;
+      int bY = cy + 49, bW = 39;
+
+      if (c1Changed) {
+        int c1BoxX = cx + 8;
+        tft.fillRect(c1BoxX + 1, bY + 11, bW - 2, 14, COLOR_BG);
+        drawTacticalPrintf(c1BoxX + 4, bY + 14, COLOR_WHITE, COLOR_BG, 1,
+                           "%2.2fA", sysCurr1);
+      }
+      if (c2Changed) {
+        int c2BoxX = cx + 51;
+        tft.fillRect(c2BoxX + 1, bY + 11, bW - 2, 14, COLOR_BG);
+        drawTacticalPrintf(c2BoxX + 4, bY + 14, COLOR_WHITE, COLOR_BG, 1,
+                           "%2.2fA", sysCurr2);
       }
     }
   }
@@ -1627,15 +1963,15 @@ void loop() {
   scanButtons();
   handleTemperatureSampling();
   handleTofSampling();
+  handleCurrentSampling();
   handleLightAnimation();
 
   unsigned long now = millis();
 
   // 四顆按鍵同時持續按住 1 秒 (CFG_RESET_PRESS_DURATION_MS) 檢測 System Reset
-  bool allFourDown = (btns[0].stableState == LOW &&
-                      btns[1].stableState == LOW &&
-                      btns[2].stableState == LOW &&
-                      btns[3].stableState == LOW);
+  bool allFourDown =
+      (btns[0].stableState == LOW && btns[1].stableState == LOW &&
+       btns[2].stableState == LOW && btns[3].stableState == LOW);
 
   if (allFourDown && now > stateSwitchLockout) {
     if (resetPressStartTime == 0) {
@@ -1649,10 +1985,54 @@ void loop() {
     resetPressStartTime = 0;
   }
 
+  // 左右雙鍵 (Button B: 右, Button C: 左) 同時長按 1.5 秒 (CFG_MUTE_HOLD_MS)
+  // 切換靜音
+  bool dualLeftRightDown = (btns[1].stableState == LOW &&
+                            btns[2].stableState == LOW && !allFourDown);
+  if (dualLeftRightDown && now > stateSwitchLockout) {
+    if (mutePressStartTime == 0) {
+      mutePressStartTime = now;
+      muteToggleTriggered = false;
+    } else if (!muteToggleTriggered &&
+               (now - mutePressStartTime >= CFG_MUTE_HOLD_MS)) {
+      muteToggleTriggered = true;
+      isMuted = !isMuted;
+      if (!isMuted) {
+        // 解除靜音提示音
+        sfxTone(3500, 30);
+      }
+      if (currentState == STATE_HOME) {
+        if (isMuted) {
+          tft.drawBitmap(42, 4, icon_mute_8x8, 8, 8, COLOR_AMBER, COLOR_BG);
+        } else {
+          tft.fillRect(42, 4, 8, 8, COLOR_BG);
+        }
+      }
+    }
+  } else {
+    mutePressStartTime = 0;
+    muteToggleTriggered = false;
+  }
+
   // ================= 狀態 1：首頁 (HUD HOME) =================
   if (currentState == STATE_HOME) {
+    // 檢測在首頁長按 BACK (Button D, PIN_KEY_D) 3 秒進入待機深度睡眠
+    if (btns[3].stableState == LOW && !allFourDown && !dualLeftRightDown &&
+        now > stateSwitchLockout) {
+      if (sleepPressStartTime == 0) {
+        sleepPressStartTime = now;
+      } else if (now - sleepPressStartTime >= CFG_SLEEP_HOLD_MS) {
+        sleepPressStartTime = 0;
+        enterDeepSleep(true); // 存入當前設定至 Preferences 並沉睡
+        return;
+      }
+    } else {
+      sleepPressStartTime = 0;
+    }
+
     // [右翼 >] 按鍵 B (W / B)：向右切換 (roll left)
-    if (btns[1].justPressed) {
+    if (btns[1].justPressed && btns[2].stableState == HIGH &&
+        !dualLeftRightDown) {
       sfxNavigate();
       playCyberTransition(false);
       carouselIndex = (carouselIndex + 1) % TOTAL_CAROUSEL;
@@ -1661,7 +2041,8 @@ void loop() {
       playPageEntranceAnimation(carouselIndex);
     }
     // [左翼 <] 按鍵 C (Q / C)：向左切換 (roll right)
-    else if (btns[2].justPressed) {
+    else if (btns[2].justPressed && btns[1].stableState == HIGH &&
+             !dualLeftRightDown) {
       sfxNavigate();
       playCyberTransition(true);
       carouselIndex = (carouselIndex - 1 + TOTAL_CAROUSEL) % TOTAL_CAROUSEL;
@@ -1670,7 +2051,7 @@ void loop() {
       playPageEntranceAnimation(carouselIndex);
     }
     // [底右 ENTER] 按鍵 A (E / A)：選入分頁
-    else if (btns[0].justPressed) {
+    else if (btns[0].justPressed && !allFourDown) {
       sfxEnter();
       currentState = STATE_SUBPAGE;
       cursorRow = 0;
@@ -1707,7 +2088,8 @@ void loop() {
           updateLightRow(oldRow);
           updateLightRow(cursorRow);
         }
-        // [右翼 DOWN] 按鍵 B (W): 游標下移 (Navigate 音效，自動跳過灰底停用項目)
+        // [右翼 DOWN] 按鍵 B (W): 游標下移 (Navigate
+        // 音效，自動跳過灰底停用項目)
         if (btns[1].justPressed) {
           sfxNavigate();
           int oldRow = cursorRow;
@@ -1741,31 +2123,43 @@ void loop() {
         }
       } else {
         // [右翼 +] 按鍵 B (W): 數值增加 (靜音調節)
-        bool bTrigger = btns[1].justPressed || (btns[1].repeatTriggered && (cursorRow == 0 || cursorRow == 1 || cursorRow == 2 || cursorRow == 4));
+        bool bTrigger =
+            btns[1].justPressed ||
+            (btns[1].repeatTriggered && (cursorRow == 0 || cursorRow == 1 ||
+                                         cursorRow == 2 || cursorRow == 4));
         if (bTrigger) {
           if (cursorRow == 0) {
-            if (lightCfg.style != MODE_RAINBOW && lightCfg.style != MODE_PARTY) {
+            if (lightCfg.style != MODE_RAINBOW &&
+                lightCfg.style != MODE_PARTY) {
               lightCfg.hue = (lightCfg.hue + CFG_STEP_HUE) % 360;
             }
           }
-          if (cursorRow == 1 && lightCfg.style != MODE_PARTY && (btns[1].justPressed || btns[1].repeatTriggered))
-            lightCfg.sat = constrain(lightCfg.sat + CFG_STEP_SATURATION, 0, 100);
-          if (cursorRow == 2 && (btns[1].justPressed || btns[1].repeatTriggered))
-            lightCfg.val = constrain(lightCfg.val + CFG_STEP_BRIGHTNESS, 0, 100);
+          if (cursorRow == 1 && lightCfg.style != MODE_PARTY &&
+              (btns[1].justPressed || btns[1].repeatTriggered))
+            lightCfg.sat =
+                constrain(lightCfg.sat + CFG_STEP_SATURATION, 0, 100);
+          if (cursorRow == 2 &&
+              (btns[1].justPressed || btns[1].repeatTriggered))
+            lightCfg.val =
+                constrain(lightCfg.val + CFG_STEP_BRIGHTNESS, 0, 100);
           if (cursorRow == 3 && btns[1].justPressed) {
             lightCfg.style = (lightCfg.style + 1) % TOTAL_LIGHT_MODES;
-            for (int r = 0; r < 5; r++) updateLightRow(r);
+            for (int r = 0; r < 5; r++)
+              updateLightRow(r);
           }
           if (cursorRow == 4) {
             if (lightCfg.style == MODE_RAINING) {
-              lightCfg.speed = constrain(lightCfg.speed + CFG_STEP_SPEED, -50, 50);
+              lightCfg.speed =
+                  constrain(lightCfg.speed + CFG_STEP_SPEED, -50, 50);
             } else if (lightCfg.style != MODE_STATIC) {
-              lightCfg.speed = constrain(lightCfg.speed + CFG_STEP_SPEED, 1, 100);
+              lightCfg.speed =
+                  constrain(lightCfg.speed + CFG_STEP_SPEED, 1, 100);
             }
           }
           if (cursorRow != 3) {
             updateLightRow(cursorRow);
-            if (cursorRow == 0 && lightCfg.style != MODE_RAINBOW && lightCfg.style != MODE_PARTY) {
+            if (cursorRow == 0 && lightCfg.style != MODE_RAINBOW &&
+                lightCfg.style != MODE_PARTY) {
               updateLightRow(1);
               updateLightRow(2);
             }
@@ -1773,32 +2167,44 @@ void loop() {
           drawSubpageTopBar();
         }
         // [左翼 -] 按鍵 C (Q): 數值減少 (靜音調節)
-        bool cTrigger = btns[2].justPressed || (btns[2].repeatTriggered && (cursorRow == 0 || cursorRow == 1 || cursorRow == 2 || cursorRow == 4));
+        bool cTrigger =
+            btns[2].justPressed ||
+            (btns[2].repeatTriggered && (cursorRow == 0 || cursorRow == 1 ||
+                                         cursorRow == 2 || cursorRow == 4));
         if (cTrigger) {
           if (cursorRow == 0) {
-            if (lightCfg.style != MODE_RAINBOW && lightCfg.style != MODE_PARTY) {
+            if (lightCfg.style != MODE_RAINBOW &&
+                lightCfg.style != MODE_PARTY) {
               lightCfg.hue = (lightCfg.hue - CFG_STEP_HUE + 360) % 360;
             }
           }
-          if (cursorRow == 1 && lightCfg.style != MODE_PARTY && (btns[2].justPressed || btns[2].repeatTriggered))
-            lightCfg.sat = constrain(lightCfg.sat - CFG_STEP_SATURATION, 0, 100);
-          if (cursorRow == 2 && (btns[2].justPressed || btns[2].repeatTriggered))
-            lightCfg.val = constrain(lightCfg.val - CFG_STEP_BRIGHTNESS, 0, 100);
+          if (cursorRow == 1 && lightCfg.style != MODE_PARTY &&
+              (btns[2].justPressed || btns[2].repeatTriggered))
+            lightCfg.sat =
+                constrain(lightCfg.sat - CFG_STEP_SATURATION, 0, 100);
+          if (cursorRow == 2 &&
+              (btns[2].justPressed || btns[2].repeatTriggered))
+            lightCfg.val =
+                constrain(lightCfg.val - CFG_STEP_BRIGHTNESS, 0, 100);
           if (cursorRow == 3 && btns[2].justPressed) {
             lightCfg.style =
                 (lightCfg.style - 1 + TOTAL_LIGHT_MODES) % TOTAL_LIGHT_MODES;
-            for (int r = 0; r < 5; r++) updateLightRow(r);
+            for (int r = 0; r < 5; r++)
+              updateLightRow(r);
           }
           if (cursorRow == 4) {
             if (lightCfg.style == MODE_RAINING) {
-              lightCfg.speed = constrain(lightCfg.speed - CFG_STEP_SPEED, -50, 50);
+              lightCfg.speed =
+                  constrain(lightCfg.speed - CFG_STEP_SPEED, -50, 50);
             } else if (lightCfg.style != MODE_STATIC) {
-              lightCfg.speed = constrain(lightCfg.speed - CFG_STEP_SPEED, 1, 100);
+              lightCfg.speed =
+                  constrain(lightCfg.speed - CFG_STEP_SPEED, 1, 100);
             }
           }
           if (cursorRow != 3) {
             updateLightRow(cursorRow);
-            if (cursorRow == 0 && lightCfg.style != MODE_RAINBOW && lightCfg.style != MODE_PARTY) {
+            if (cursorRow == 0 && lightCfg.style != MODE_RAINBOW &&
+                lightCfg.style != MODE_PARTY) {
               updateLightRow(1);
               updateLightRow(2);
             }

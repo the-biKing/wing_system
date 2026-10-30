@@ -6,8 +6,12 @@
 #include <Arduino.h>
 #include "config.h"
 
-// 基礎單音播放 (Tone & Silence)
+// 全域靜音狀態旗標 (定義於主程式 wingUI.ino)
+extern bool isMuted;
+
+// 基礎單音播放 (Tone & Silence) - 靜音模式下自動不發聲
 inline void sfxTone(uint32_t freq, uint32_t durationMs) {
+  if (isMuted) return;
   if (freq == 0) {
     ledcWriteTone(BUZZER_PIN, 0);
   } else {

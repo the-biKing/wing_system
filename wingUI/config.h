@@ -33,6 +33,11 @@
 #define PIN_TOF_SDA      21  // I2C 資料線 (SDA)
 #define PIN_TOF_SCL      15  // I2C 時脈線 (SCL)
 
+// --- ACS712 電流感測器 (Current Sensors) ---
+#define PIN_CURRENT_ACS712_1 35 // 電流感測器 1 類比訊號輸入腳位 (ACS712-20A, GPIO 35)
+#define PIN_CURRENT_ACS712_2 34 // 電流感測器 2 類比訊號輸入腳位 (ACS712T-05B, GPIO 34)
+#define PIN_CURRENT_ACS712   PIN_CURRENT_ACS712_1 // 向後相容別名
+
 
 // ==========================================================
 // 2. 按鍵彈跳與連發行為設定 (Button Debounce & Repeat Timing)
@@ -49,6 +54,15 @@ const unsigned long CFG_BUTTON_REPEAT_RATE_MS = 40;
 
 // 四鍵同時長按系統重置延遲 (毫秒)：四顆鍵同時按住多久觸發硬體重置
 const unsigned long CFG_RESET_PRESS_DURATION_MS = 1000;
+
+// 首頁長按 BACK (Button D) 進入深度睡眠待機時間 (毫秒)
+const unsigned long CFG_SLEEP_HOLD_MS = 3000;
+
+// 待機中長按任意鍵喚醒回活躍模式時間 (毫秒)
+const unsigned long CFG_WAKE_HOLD_MS = 2000;
+
+// 同時長按左右雙鍵 (Button B + C) 切換靜音時間 (毫秒)
+const unsigned long CFG_MUTE_HOLD_MS = 1500;
 
 
 // ==========================================================
@@ -78,6 +92,28 @@ const unsigned long CFG_TEMP_ALARM_INTERVAL_MS = 1500;
 
 // ToF 測距感測器採樣間隔 (毫秒)：每隔多久向 VL53L0X 讀取一次距離 (mm)
 const unsigned long CFG_TOF_SAMPLE_INTERVAL_MS = 60;
+
+// ACS712-20A (電流感測器 1, GPIO 35 - 3.3V 供電實測基準)
+// 20A 規格靈敏度為 100 mV/A (0.100 V/A)
+const float CFG_ACS712_1_SENSITIVITY_MV_PER_A = 100.0f;
+// 3.3V 供電實測 0A 靜態中點電壓 1663mV
+const float CFG_ACS712_1_ZERO_MV              = 1663.0f;
+const float CFG_ACS712_1_DIVIDER_RATIO        = 1.0f;
+const float CFG_ACS712_1_DEADBAND_AMPS        = 0.06f; // 0.06A 零點死區抗雜訊
+
+// ACS712T-05B (電流感測器 2, GPIO 34 - 3.3V 供電實測基準)
+// 05B (5A) 規格靈敏度為 185 mV/A (0.185 V/A)
+const float CFG_ACS712_2_SENSITIVITY_MV_PER_A = 185.0f;
+// 3.3V 供電實測 0A 靜態中點電壓 1232mV
+const float CFG_ACS712_2_ZERO_MV              = 1232.0f;
+const float CFG_ACS712_2_DIVIDER_RATIO        = 1.0f;
+const float CFG_ACS712_2_DEADBAND_AMPS        = 0.50f; // 0.50A 零點死區抗雜訊 (消除 3.3V 欠壓底噪)
+
+// 零點基準已依 3.3V 實測鎖定，關閉開機強制取樣歸零避免通電接線影響
+const bool CFG_ACS712_AUTO_ZERO = false;
+
+// 電流感測器採樣間隔 (毫秒)
+const unsigned long CFG_CURRENT_SAMPLE_INTERVAL_MS = 60;
 
 
 // ==========================================================

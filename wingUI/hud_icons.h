@@ -39,6 +39,20 @@ const uint8_t icon_select[] PROGMEM = {
   0x38, 0x44, 0xBA, 0xBA, 0xBA, 0x44, 0x38
 };
 
+// 圖標: mute (8x8) - 靜音喇叭帶 X
+#define ICON_MUTE_W 8
+#define ICON_MUTE_H 8
+const uint8_t icon_mute_8x8[] PROGMEM = {
+  0x20, // 0b00100000
+  0x69, // 0b01101001
+  0xE6, // 0b11100110
+  0xE6, // 0b11100110
+  0xE9, // 0b11101001
+  0x60, // 0b01100000
+  0x20, // 0b00100000
+  0x00  // 0b00000000
+};
+
 // 圖標: T_low (6x14) - 低溫 (金黃外框/刻度 + 藍色水銀液面 0x4B7E / 0x05BD)
 #define ICON_T_LOW_W 6
 #define ICON_T_LOW_H 14
