@@ -13,7 +13,7 @@
 // ==========================================================
 // 2. 馬達 PWM 驅動設定 (Motor PWM & Dead-time Config)
 // ==========================================================
-const uint32_t MOTOR_PWM_FREQ       = 5000; // 5 kHz PWM 頻率 (消除人耳尖銳嘯叫聲)
+const uint32_t MOTOR_PWM_FREQ       = 1000; // 1 kHz PWM 頻率 (配合 MOSFET 10k 洩放電阻)
 const uint8_t  MOTOR_PWM_RES        = 8;    // 8-bit 解析度 (0 ~ 255)
 const uint8_t  MOTOR_PWM_CH         = 4;    // LEDC 通道 (ESP32 Core 2.x 使用)
 const uint32_t MOTOR_DEAD_TIME_MS   = 15;   // 換向保護延遲 (ms)，防止 H 橋直通短路
@@ -23,25 +23,25 @@ const uint32_t MOTOR_DEAD_TIME_MS   = 15;   // 換向保護延遲 (ms)，防止 
 //    這些數值可由 test_sensor_stroke 與 test_actuation_pwm
 //    實測獲得，並可寫入 NVS Preferences 持久化儲存。
 // ==========================================================
-#define CFG_DEFAULT_Y_MIN_MM        35.0f   // 機械下死點極限 (mm)
-#define CFG_DEFAULT_Y_MAX_MM        85.0f   // 機械上死點極限 (mm)
-#define CFG_DEFAULT_STROKE_SPAN_MM  50.0f   // 行程全幅 (y_max - y_min) (mm)
+#define CFG_DEFAULT_Y_MIN_MM        53.7f   // 機械下死點極限 (mm) - 實測校準鎖定 (最新校準)
+#define CFG_DEFAULT_Y_MAX_MM        101.7f  // 機械上死點極限 (mm) - 實測校準鎖定 (最新校準)
+#define CFG_DEFAULT_STROKE_SPAN_MM  48.0f   // 行程全幅 (y_max - y_min) (mm)
 
-// --- 雙閥值摩擦補償 (Dual-Threshold Friction Compensation) ---
-// (1) 靜摩擦突破前饋 (Breakaway / Stiction)：靜止時克服咬合啟動所需 (例如 100/255 ≈ 0.39)
-#define CFG_DEFAULT_U_BREAKAWAY_POS 0.39f   // 正向靜摩擦突破 PWM
-#define CFG_DEFAULT_U_BREAKAWAY_NEG 0.39f   // 反向靜摩擦突破 PWM
+// --- 基於實測之 Scotch Yoke 位置相依摩擦補償 (Position-Dependent Friction) ---
+// (1) 行程中央滑動摩擦 (Mid-Stroke ~50%): 實測只需要 PWM 22~30
+#define CFG_DEFAULT_U_MID_BREAKAWAY  0.118f   // 行程中段起步 PWM ~30
+#define CFG_DEFAULT_U_MID_KINETIC    0.086f   // 行程中段維持 PWM ~22
 
-// (2) 動摩擦維持前饋 (Kinetic / Running)：轉動中維持運動最低所需 (例如 50/255 ≈ 0.20)
-#define CFG_DEFAULT_U_KINETIC_POS   0.20f   // 正向動摩擦維持 PWM
-#define CFG_DEFAULT_U_KINETIC_NEG   0.20f   // 反向動摩擦維持 PWM
+// (2) 幾何死點極限摩擦 (Dead-Center 0% & 100%): 實測需要 PWM 100~104
+#define CFG_DEFAULT_U_DEAD_BREAKAWAY 0.400f   // 死點端點起步 PWM ~102
+#define CFG_DEFAULT_U_DEAD_KINETIC   0.380f   // 死點端點維持 PWM ~97
 
-// 運動速度切換過渡門檻 (mm/s)：低於此速度視為起步/微速，高於此速度平滑過渡至動摩擦補償
+// 運動速度切換過渡門檻 (mm/s)
 const float CFG_STICTION_VELOCITY_THRESH_MM_S = 6.0f;
 
-// ADRC 控制增益基線
-#define CFG_DEFAULT_B0_INIT         12.0f   // 初始系統控制權重 b0
-#define CFG_DEFAULT_B0_MIN          0.8f    // Scotch Yoke 死點奇異值正規化下限 clamp
+// ADRC 控制增益基線 (實測動態響應換算)
+#define CFG_DEFAULT_B0_INIT         94.4f   // 初始系統控制權重 b0
+#define CFG_DEFAULT_B0_MIN          3.0f    // Scotch Yoke 死點奇異值正規化下限 clamp
 #define CFG_DEFAULT_POLARITY        1       // 1: 正 PWM 增加距離, -1: 正 PWM 減少距離
 
 // ==========================================================
@@ -51,21 +51,21 @@ const float CFG_STICTION_VELOCITY_THRESH_MM_S = 6.0f;
 const float    GUARDRAIL_MARGIN_MM    = 7.0f;
 
 // 堵轉保護 (Stall Protection)：若控制輸出超過閾值且距離無變化超過此時間 (ms)，急停保護
-const float    GUARDRAIL_STALL_PWM    = 0.45f; // 45% PWM
-const float    GUARDRAIL_STALL_MIN_DY = 1.2f;  // 最小應移動距離 (mm)
-const uint32_t GUARDRAIL_STALL_MS     = 600;   // 600ms 堵轉超時
+const float    GUARDRAIL_STALL_PWM    = 210.0f; // PWM 輸出門檻 (210/255 ≈ 82% 功率)
+const float    GUARDRAIL_STALL_MIN_DY = 1.5f;   // 最小應移動距離 (mm)
+const uint32_t GUARDRAIL_STALL_MS     = 2000;   // 放寬至 2000ms (2.0 秒)，允許大機構啟動克服慣性
 
 // 感測器失聯/失效超時 (ms)
 const uint32_t SENSOR_TIMEOUT_MS      = 250;
 
 // ==========================================================
-// 5. ADRC 控制器與擴展狀態觀測器 (ESO) 頻寬參數
+// 5. ADRC 控制器與擴展狀態觀測器 (ESO) 頻寬參數 (數值收斂調優)
 // ==========================================================
-const float ADRC_OMEGA_O  = 35.0f;  // 觀測器頻寬 (Observer Bandwidth, rad/s)
-const float ADRC_OMEGA_C  = 7.0f;   // 控制器頻寬 (Controller Bandwidth, rad/s)
+const float ADRC_OMEGA_O  = 12.0f;  // 觀測器頻寬 (rad/s) - 確保 10ms 離散尤拉積分數值收斂
+const float ADRC_OMEGA_C  = 4.0f;   // 控制器頻寬 (rad/s) - Kp=16, Kd=8
 
 // CFDL 動態線性化參數
-const float CFDL_RHO      = 0.25f;  // 自適應步長學習率
-const float CFDL_MU       = 0.02f;  // 正規化防除以零常數
-const float CFDL_EPS_U    = 0.015f; // 激勵輸入變動閾值
-const float CFDL_EPS_A    = 0.008f; // 激勵加速度變動閾值
+const float CFDL_RHO      = 0.15f;  // 自適應步長學習率
+const float CFDL_MU       = 0.05f;  // 正規化防除以零常數
+const float CFDL_EPS_U    = 0.02f;  // 激勵輸入變動閾值
+const float CFDL_EPS_A    = 0.01f;  // 激勵加速度變動閾值

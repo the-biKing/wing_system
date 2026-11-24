@@ -7,6 +7,7 @@
 #include <Wire.h>
 #include <math.h>
 
+#include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
 #include <driver/rtc_io.h>
 
@@ -14,6 +15,15 @@
 #include "custom_font.h"
 #include "hud_icons.h"
 #include "sfx.h"
+#include "web_hud.h"
+
+// WS2812 幻彩 RGB 燈條實例 (GPIO 16)
+Adafruit_NeoPixel strip(CFG_WS2812_NUM_LEDS, PIN_WS2812, NEO_GRB + NEO_KHZ800);
+
+// 2S 電池電量監測變數 (GPIO 36)
+float sysBatteryVolt = 7.4f;
+int sysBatteryPct = 85;
+unsigned long lastBatSampleTime = 0;
 
 // 全域 NVS 與系統設定
 Preferences preferences;
@@ -188,33 +198,14 @@ void drawTacticalPrintf(int x, int y, uint16_t color, uint16_t bg, uint8_t size,
 
 // ================= 狀態機與參數結構 =================
 
-enum SysState { STATE_HOME, STATE_SUBPAGE };
 SysState currentState = STATE_HOME;
-
-enum CarouselItem { PAGE_LIGHT = 0, PAGE_MOTOR = 1, PAGE_SENSORS = 2 };
 int carouselIndex = PAGE_LIGHT;
 const int TOTAL_CAROUSEL = 3;
 
-enum LightMode {
-  MODE_STATIC = 0,
-  MODE_RAINBOW = 1,
-  MODE_BREATHING = 2,
-  MODE_THUNDER = 3,
-  MODE_RAINING = 4,
-  MODE_PARTY = 5
-};
-const int TOTAL_LIGHT_MODES = 6;
 const char *const LIGHT_MODE_NAMES[TOTAL_LIGHT_MODES] = {
     "STATIC", "RAINBOW", "BREATHE", "THUNDER", "RAINING", "PARTY"};
 
-struct LightConfig {
-  uint16_t hue = CFG_DEFAULT_HUE;
-  uint8_t sat = CFG_DEFAULT_SAT;
-  uint8_t val = CFG_DEFAULT_VAL;
-  uint8_t style = MODE_STATIC;
-  int8_t speed = CFG_DEFAULT_LIGHT_SPEED; // 特效速度 (支援負值: RAINING 模式
-                                          // -50 ~ +50, 其他 1 ~ 100)
-} lightCfg, lightBackup;
+LightConfig lightCfg, lightBackup;
 
 void hsvToRgb(uint16_t h, uint8_t s, uint8_t v, uint8_t &r, uint8_t &g,
               uint8_t &b) {
@@ -402,6 +393,136 @@ void drawLightPreviewCircle(int rx, int ry, int r) {
   }
 }
 
+void updatePhysicalWs2812() {
+  uint16_t numPix = strip.numPixels();
+  if (numPix == 0)
+    return;
+
+  // 若燈條亮度為 0 或關閉，關閉 NMOS 供電以徹底阻斷靜態漏電 (GPIO 19 = LOW)
+  if (lightCfg.val == 0) {
+    strip.clear();
+    strip.show();
+    digitalWrite(PIN_WS2812_EN, LOW);
+    return;
+  }
+
+  // 燈條使用中，確保 NMOS 導通供電 (GPIO 19 = HIGH)
+  if (digitalRead(PIN_WS2812_EN) == LOW) {
+    digitalWrite(PIN_WS2812_EN, HIGH);
+    delay(20); // 剛開電給予足夠時間讓燈條電路與濾波電容充電穩定
+  }
+
+  // 18A 電流安全防護：動態閉迴路亮度限幅
+  static uint8_t maxSafeVal = 100;
+  static unsigned long lastOverCurrentAlarm = 0;
+  bool isOverCurrent = (sysCurr1 >= CFG_OVERCURRENT_LIMIT_A);
+
+  if (isOverCurrent) {
+    // 電流達到或超過 18A：主動向下壓制最大容許亮度，阻止發出更高亮度
+    if (maxSafeVal > (uint8_t)(lightCfg.val * 0.85f)) {
+      maxSafeVal = (uint8_t)(lightCfg.val * 0.85f);
+    } else if (maxSafeVal > 2) {
+      maxSafeVal--;
+    }
+    // 警報音效 (每 1.5 秒警告一次)
+    if (millis() - lastOverCurrentAlarm >= 1500) {
+      lastOverCurrentAlarm = millis();
+      sfxWarning();
+      Serial.printf("[OVERCURRENT] sysCurr1: %.2fA >= %.1fA! Brightness clamped to %d%%\n",
+                    sysCurr1, CFG_OVERCURRENT_LIMIT_A, maxSafeVal);
+    }
+  } else if (sysCurr1 < (CFG_OVERCURRENT_LIMIT_A - CFG_OVERCURRENT_HYST_A)) {
+    // 電流回落至 16.5A 以下：平滑放寬上限
+    static unsigned long lastRecoveryTick = 0;
+    if (millis() - lastRecoveryTick >= 250) {
+      lastRecoveryTick = millis();
+      if (maxSafeVal < 100) maxSafeVal++;
+    }
+  }
+
+  uint8_t effectiveVal = min((uint8_t)lightCfg.val, maxSafeVal);
+
+  if (lightCfg.style == MODE_STATIC) {
+    uint8_t r, g, b;
+    hsvToRgb(lightCfg.hue, lightCfg.sat, effectiveVal, r, g, b);
+    uint32_t col = strip.Color(r, g, b);
+    for (uint16_t i = 0; i < numPix; i++)
+      strip.setPixelColor(i, col);
+  } else if (lightCfg.style == MODE_RAINBOW) {
+    for (uint16_t i = 0; i < numPix; i++) {
+      int ringHue =
+          ((int)(animRainbowPhase + (i * 360 / numPix)) % 360 + 360) % 360;
+      uint8_t r, g, b;
+      hsvToRgb(ringHue, lightCfg.sat, effectiveVal, r, g, b);
+      strip.setPixelColor(i, strip.Color(r, g, b));
+    }
+  } else if (lightCfg.style == MODE_BREATHING) {
+    float breath = 0.5f + 0.5f * sin(animBreathePhase);
+    uint8_t curBri = (uint8_t)(effectiveVal * (0.05f + 0.95f * breath));
+    uint8_t r, g, b;
+    hsvToRgb(lightCfg.hue, lightCfg.sat, curBri, r, g, b);
+    uint32_t col = strip.Color(r, g, b);
+    for (uint16_t i = 0; i < numPix; i++)
+      strip.setPixelColor(i, col);
+  } else if (lightCfg.style == MODE_THUNDER) {
+    float scale = (lightCfg.val > 0) ? ((float)effectiveVal / (float)lightCfg.val) : 1.0f;
+    uint8_t clampedThunder = (uint8_t)(thunderBrightness * scale);
+    uint8_t r, g, b;
+    hsvToRgb(lightCfg.hue, (lightCfg.sat * 2) / 3, clampedThunder, r, g, b);
+    uint32_t col = strip.Color(r, g, b);
+    for (uint16_t i = 0; i < numPix; i++)
+      strip.setPixelColor(i, col);
+  } else if (lightCfg.style == MODE_RAINING) {
+    float degStep = 360.0f / (float)numPix;
+    for (uint16_t i = 0; i < numPix; i++) {
+      float deg = i * degStep;
+      float diff1, diff2;
+      if (lightCfg.speed >= 0) {
+        diff1 = fmod(rainAngle - deg + 360.0f, 360.0f);
+        diff2 = fmod((rainAngle + 180.0f) - deg + 360.0f, 360.0f);
+      } else {
+        diff1 = fmod(deg - rainAngle + 360.0f, 360.0f);
+        diff2 = fmod(deg - (rainAngle + 180.0f) + 360.0f, 360.0f);
+      }
+      float minDiff = (diff1 < diff2) ? diff1 : diff2;
+      float briFactor = 0.04f;
+      if (minDiff < 90.0f) {
+        briFactor = 1.0f - (minDiff / 90.0f) * 0.85f;
+      }
+      uint8_t pBri = (uint8_t)(effectiveVal * briFactor);
+      uint8_t r, g, b;
+      hsvToRgb(lightCfg.hue, lightCfg.sat, pBri, r, g, b);
+      strip.setPixelColor(i, strip.Color(r, g, b));
+    }
+  } else if (lightCfg.style == MODE_PARTY) {
+    float scale = (lightCfg.val > 0) ? ((float)effectiveVal / (float)lightCfg.val) : 1.0f;
+    uint8_t clampedParty = (uint8_t)(partyCurBri * scale);
+    uint8_t r, g, b;
+    hsvToRgb(partyCurHue, partyCurSat, clampedParty, r, g, b);
+    uint32_t col = strip.Color(r, g, b);
+    for (uint16_t i = 0; i < numPix; i++)
+      strip.setPixelColor(i, col);
+  }
+
+  strip.show();
+
+  // 序列埠狀態監視 (數值變動或每 3 秒輸出一次)
+  static unsigned long lastWs2812Log = 0;
+  static uint8_t lastLoggedStyle = 255;
+  static uint16_t lastLoggedHue = 999;
+  static uint8_t lastLoggedVal = 255;
+  bool stateChanged = (lightCfg.style != lastLoggedStyle || lightCfg.hue != lastLoggedHue || effectiveVal != lastLoggedVal);
+  if (stateChanged || (millis() - lastWs2812Log >= 3000)) {
+    lastWs2812Log = millis();
+    lastLoggedStyle = lightCfg.style;
+    lastLoggedHue = lightCfg.hue;
+    lastLoggedVal = effectiveVal;
+    Serial.printf("[WS2812] Style:%s | Hue:%d | Sat:%d | Val:%d(Eff:%d) | EN(GPIO19):%d\n",
+                  LIGHT_MODE_NAMES[lightCfg.style], lightCfg.hue, lightCfg.sat, lightCfg.val, effectiveVal,
+                  digitalRead(PIN_WS2812_EN));
+  }
+}
+
 void handleLightAnimation() {
   unsigned long now = millis();
   if (now - lastLightAnimTick < 33)
@@ -430,14 +551,61 @@ void handleLightAnimation() {
 
   updatePartyAnimation(now);
 
+  // 同步更新實體 WS2812 幻彩燈條
+  updatePhysicalWs2812();
+
   if (currentState == STATE_HOME && carouselIndex == PAGE_LIGHT) {
     drawLightPreviewCircle(63, 62, 8);
   }
 }
 
-struct MotorConfig {
-  uint8_t speed = CFG_DEFAULT_MOTOR_SPEED;
-} motorCfg, motorBackup;
+MotorConfig motorCfg, motorBackup;
+
+GuardrailState motorGuardStatus = GUARD_OK;
+
+// 伺服控制器運作狀態
+bool motorServoActive = false;         // 正在執行閉迴路伺服定點位移
+bool motorServoArrived = false;        // 已抵達定點狀態 (顯示 ARRIVED! PWM:0)
+float motorTargetPct = 50.0f;          // 目標百分比 [0.0 ~ 100.0%]
+float motorTargetMm = 77.4f;           // 最終目標物理位置 [mm]
+float motorActiveTargetMm = 77.4f;     // 動態追蹤軌跡設定點 [mm]
+float maxProfileVelMmS = 30.0f;        // 軌跡最大位移速度 (30 mm/s)
+const float MAX_PWM_SLEW_UP = 15.0f;   // 每個控制週期 (30ms) 最大升速 PWM 步階
+const float MAX_PWM_SLEW_DOWN = 35.0f; // 每個控制週期最大減速 PWM 步階
+
+// PID 參數
+float motorKp = 4.0f;
+float motorKi = 0.8f;
+float motorKd = 1.2f;
+float motorIntegralErr = 0.0f;
+float motorCurrentOutPwm = 0.0f;
+float lastMotorMeasuredDistMm = 77.4f;
+float motorFilteredVelocityMmS = 0.0f;
+unsigned long motorHighEffortStartTime = 0;
+float motorStallCheckStartDist = 0.0f;
+unsigned long lastMotorCtrlTimeMs = 0;
+const unsigned long MOTOR_CTRL_PERIOD_MS = 30;
+static bool lastMotorForwardState = true;
+
+// 蘇格蘭軛機構目標毫米換算 (含軟體安全邊界 clamp)
+float calcTargetMm(float pct) {
+  float safe_min = CFG_DEFAULT_Y_MIN_MM + SOFT_LIMIT_LOW_OFFSET_MM;
+  float safe_max = CFG_DEFAULT_Y_MAX_MM - SOFT_LIMIT_HIGH_OFFSET_MM;
+  pct = constrain(pct, 0.0f, 100.0f);
+  return safe_min + (pct / 100.0f) * (safe_max - safe_min);
+}
+
+// Scotch Yoke 位置相依摩擦補償 (U形力矩曲線: 端點~102, 中段~30)
+float getScotchYokeFeedforward(float posMm) {
+  float norm_pos = (posMm - CFG_DEFAULT_Y_MIN_MM) / CFG_DEFAULT_STROKE_SPAN_MM;
+  norm_pos = constrain(norm_pos, 0.0f, 1.0f);
+  float eta = fabs(norm_pos - 0.5f) * 2.0f;
+  float eta3 = eta * eta * eta;
+  float u_ff =
+      CFG_DEFAULT_U_MID_BREAKAWAY +
+      (CFG_DEFAULT_U_DEAD_BREAKAWAY - CFG_DEFAULT_U_MID_BREAKAWAY) * eta3;
+  return u_ff * 255.0f;
+}
 
 // DS18B20 1-Wire 實例
 OneWire oneWire(PIN_TEMP_DS18B20);
@@ -447,7 +615,111 @@ DallasTemperature tempSensor(&oneWire);
 Adafruit_VL53L0X lox = Adafruit_VL53L0X();
 bool vl53l0xReady = false;
 int16_t tofDistanceMm = -1; // -1 表示感測器未就緒或超出測量範圍
+float currentTofDistMm = 0.0f;
 unsigned long lastTofSampleTime = 0;
+unsigned long lastTofValidReadTime = 0;
+
+// ToF 雙級濾波器 (5-Tap 中值濾波 + 一階 IIR 低通)
+const int TOF_MEDIAN_WINDOW = 5;
+float tofMedianBuf[TOF_MEDIAN_WINDOW] = {0};
+uint8_t tofMedianIdx = 0;
+bool tofMedianFilled = false;
+float iirTofDistanceMm = 0.0f;
+bool iirTofInitialized = false;
+const float TOF_IIR_ALPHA = 0.70f;
+
+float getTofMedian(float *arr, int n) {
+  float temp[TOF_MEDIAN_WINDOW];
+  for (int i = 0; i < n; i++)
+    temp[i] = arr[i];
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = i + 1; j < n; j++) {
+      if (temp[i] > temp[j]) {
+        float t = temp[i];
+        temp[i] = temp[j];
+        temp[j] = t;
+      }
+    }
+  }
+  return temp[n / 2];
+}
+
+// 馬達底層硬體輸出函式
+void setMotorRaw(bool forward, uint8_t duty) {
+  if (duty == 0 || motorGuardStatus != GUARD_OK) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcWrite(PIN_MOTOR_PWM, 0);
+#else
+    ledcWrite(MOTOR_PWM_CH, 0);
+#endif
+    digitalWrite(PIN_MOTOR_DIR, LOW);
+    return;
+  }
+
+  if (forward != lastMotorForwardState) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcWrite(PIN_MOTOR_PWM, 0);
+#else
+    ledcWrite(MOTOR_PWM_CH, 0);
+#endif
+    delay(10);
+    digitalWrite(PIN_MOTOR_DIR, forward ? HIGH : LOW);
+    delayMicroseconds(50);
+    lastMotorForwardState = forward;
+  } else {
+    digitalWrite(PIN_MOTOR_DIR, forward ? HIGH : LOW);
+  }
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(PIN_MOTOR_PWM, duty);
+#else
+  ledcWrite(MOTOR_PWM_CH, duty);
+#endif
+}
+
+void emergencyStopMotor(GuardrailState reason) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(PIN_MOTOR_PWM, 0);
+#else
+  ledcWrite(MOTOR_PWM_CH, 0);
+#endif
+  digitalWrite(PIN_MOTOR_DIR, LOW);
+  motorServoActive = false;
+  motorServoArrived = false;
+  motorCfg.speed = 0;
+  motorGuardStatus = reason;
+  motorCurrentOutPwm = 0.0f;
+  sfxWarning();
+  Serial.printf("[MOTOR ALARM] Guardrail Tripped: %d\n", reason);
+}
+
+void stopMotorAll() {
+  setMotorRaw(true, 0);
+  motorServoActive = false;
+  motorServoArrived = false;
+  motorCfg.speed = 0;
+  motorCurrentOutPwm = 0.0f;
+  motorIntegralErr = 0.0f;
+}
+
+void startMotorServoToPct(float pct) {
+  if (motorGuardStatus != GUARD_OK || !vl53l0xReady ||
+      currentTofDistMm <= 0.0f) {
+    return;
+  }
+  pct = constrain(pct, 0.0f, 100.0f);
+  motorTargetPct = pct;
+  motorTargetMm = calcTargetMm(pct);
+  motorActiveTargetMm = currentTofDistMm;
+  motorIntegralErr = 0.0f;
+  motorCurrentOutPwm = 0.0f;
+  motorHighEffortStartTime = 0;
+  motorServoArrived = false;
+  motorServoActive = true;
+  motorCfg.speed = 0;
+  Serial.printf("[SERVO START] Moving to %0.1f%% (%0.2f mm)\n", pct,
+                motorTargetMm);
+}
 
 float sysTemp = 25.0;  // 預設室溫初值，背景自動更新
 float sysCurr1 = 0.0f; // 電流感測器 1 讀數 (ACS712 20A, GPIO 35)
@@ -491,45 +763,70 @@ const unsigned long DEBOUNCE_DELAY = 45;
 // ================= 序列埠按鍵模擬 (Serial Monitor QWER) =================
 void handleSerialInput() {
   while (Serial.available() > 0) {
-    char raw = Serial.read();
-    if (raw == '\r' || raw == '\n' || raw == ' ' || raw == '\t')
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.length() == 0)
       continue;
 
-    char ch = toupper(raw);
-    int btnIdx = -1;
-    const char *label = "";
+    if (input.length() == 1) {
+      char raw = input.charAt(0);
+      char ch = toupper(raw);
+      int btnIdx = -1;
+      const char *label = "";
 
-    // QWER 戰術佈局 (使用者指定):
-    // Q: [< / UP / -]   (Left / Button C)
-    // W: [> / DOWN / +] (Right / Button B)
-    // E: [ENTER]        (Confirm / Button A)
-    // R: [BACK]         (Return / Button D)
-    if (ch == 'Q' || ch == 'C') {
-      btnIdx = 2; // Button C (Left / Up / -)
-      label = "BTN_C [Left/Up/-]";
-    } else if (ch == 'W' || ch == 'B') {
-      btnIdx = 1; // Button B (Right / Down / +)
-      label = "BTN_B [Right/Down/+]";
-    } else if (ch == 'E' || ch == 'A') {
-      btnIdx = 0; // Button A (ENTER)
-      label = "BTN_A [ENTER]";
-    } else if (ch == 'R' || ch == 'D') {
-      btnIdx = 3; // Button D (BACK)
-      label = "BTN_D [BACK]";
-    } else if (ch == 'X') {
-      // 模擬四鍵同時按下觸發 System Reset
-      triggerSystemReset();
-      return;
-    }
+      // QWER 戰術佈局 (使用者指定):
+      // Q: [< / UP / -]   (Left / Button C)
+      // W: [> / DOWN / +] (Right / Button B)
+      // E: [ENTER]        (Confirm / Button A)
+      // R: [BACK]         (Return / Button D)
+      if (ch == 'Q' || ch == 'C') {
+        btnIdx = 2; // Button C (Left / Up / -)
+        label = "BTN_C [Left/Up/-]";
+      } else if (ch == 'W' || ch == 'B') {
+        btnIdx = 1; // Button B (Right / Down / +)
+        label = "BTN_B [Right/Down/+]";
+      } else if (ch == 'E' || ch == 'A') {
+        btnIdx = 0; // Button A (ENTER)
+        label = "BTN_A [ENTER]";
+      } else if (ch == 'R' || ch == 'D') {
+        btnIdx = 3; // Button D (BACK)
+        label = "BTN_D [BACK]";
+      } else if (ch == 'X') {
+        // 模擬四鍵同時按下觸發 System Reset
+        triggerSystemReset();
+        return;
+      }
 
-    if (btnIdx != -1) {
-      btns[btnIdx].justPressed = true;
-      Serial.printf("[SIM INPUT] '%c' -> Triggered %s\n", raw, label);
+      if (btnIdx != -1) {
+        btns[btnIdx].justPressed = true;
+        Serial.printf("[SIM INPUT] '%c' -> Triggered %s\n", raw, label);
+      } else {
+        Serial.printf("[SIM INPUT] '%c' ignored.\n", raw);
+      }
     } else {
-      Serial.printf("[SIM INPUT] '%c' ignored.\n", raw);
+      // 處理多字元指令 (Serial Commands)
+      if (input.startsWith("pos ") || input.startsWith("POS ")) {
+        float p = input.substring(4).toFloat();
+        p = constrain(p, 0.0f, 100.0f);
+        motorCfg.targetPos = (uint8_t)p;
+        startMotorServoToPct(p);
+        if (currentState == STATE_SUBPAGE && carouselIndex == PAGE_MOTOR)
+          updateMotorSubpage();
+      } else if (input.equalsIgnoreCase("stop") ||
+                 input.equalsIgnoreCase("disarm")) {
+        stopMotorAll();
+        if (currentState == STATE_SUBPAGE && carouselIndex == PAGE_MOTOR)
+          updateMotorSubpage();
+        Serial.println(F("[MOTOR] Stopped."));
+      } else if (input.equalsIgnoreCase("reset")) {
+        motorGuardStatus = GUARD_OK;
+        motorCurrentOutPwm = 0.0f;
+        motorIntegralErr = 0.0f;
+        if (currentState == STATE_SUBPAGE && carouselIndex == PAGE_MOTOR)
+          updateMotorSubpage();
+        Serial.println(F("[MOTOR] Guardrail reset."));
+      }
     }
-    Serial.println("  >> Keys: [Q] Left/Up/-  [W] Right/Down/+  [E] ENTER  [R] "
-                   "BACK  [X] System Reset");
   }
 }
 
@@ -693,10 +990,18 @@ void updateGlobalButtonBar() {
 void drawTopBar() {
   tft.fillRect(0, 0, 128, 16, COLOR_BG);
 
+  // 電池外框與即時電量填充 (2S 鋰電池 GPIO 36)
   tft.drawRect(2, 4, 15, 8, COLOR_CYAN);
   tft.fillRect(17, 6, 2, 4, COLOR_CYAN);
-  tft.fillRect(4, 6, 9, 4, COLOR_GREEN);
-  drawTacticalString(22, 5, "85%", COLOR_CYAN, COLOR_BG, 1);
+  int fillW = map(constrain(sysBatteryPct, 0, 100), 0, 100, 0, 11);
+  if (fillW > 0) {
+    tft.fillRect(4, 6, fillW, 4,
+                 sysBatteryPct > 20 ? COLOR_GREEN : COLOR_AMBER);
+  }
+  if (11 - fillW > 0) {
+    tft.fillRect(4 + fillW, 6, 11 - fillW, 4, COLOR_BG);
+  }
+  drawTacticalPrintf(22, 5, COLOR_CYAN, COLOR_BG, 1, "%3d%%", sysBatteryPct);
 
   // 靜音圖標 (位於電池百分比與 WiFi 分隔線之間)
   if (isMuted) {
@@ -706,13 +1011,20 @@ void drawTopBar() {
   tft.drawFastVLine(52, 3, 10, COLOR_DARKGREY);
   tft.drawPixel(52, 8, COLOR_AMBER);
 
+  // WiFi AP 基地台在線狀態圖示
   tft.drawBitmap(58, 4, icon_wifi_8x8, 8, 8, COLOR_GREEN, COLOR_BG);
   tft.fillRect(68, 8, 2, 4, COLOR_GREEN);
   tft.fillRect(72, 6, 2, 6, COLOR_GREEN);
   tft.fillRect(76, 4, 2, 8, COLOR_GREEN);
 
+  // 藍牙 / Web HUD 客戶端連線狀態
   tft.drawBitmap(88, 4, icon_bt_8x9, 8, 9, COLOR_CYAN, COLOR_BG);
-  drawTacticalString(98, 5, "LINK", COLOR_CYAN, COLOR_BG, 1);
+  int clients = WiFi.softAPgetStationNum();
+  if (clients > 0) {
+    drawTacticalPrintf(98, 5, COLOR_GREEN, COLOR_BG, 1, "AP:%d", clients);
+  } else {
+    drawTacticalString(98, 5, "APON", COLOR_CYAN, COLOR_BG, 1);
+  }
 
   tft.drawFastHLine(0, 16, 40, COLOR_MIDGREY);
   tft.drawFastHLine(44, 16, 40, COLOR_CYAN);
@@ -1220,10 +1532,14 @@ void updateLightRow(int row) {
                          lightCfg.sat);
     }
   } else if (row == 2) {
-    // BRI: 所有模式均受亮度控制 (守護最高亮度)
+    // BRI: 所有模式均受亮度控制 (受 18A 電流保護門檻守護)
     drawHsvTrueColorBar(44, y + 1, 40, 9, 2, lightCfg.val, 100, sel);
-    drawTacticalPrintf(88, y + 2, COLOR_LIGHTGREY, COLOR_BG, 1, "%3d",
-                       lightCfg.val);
+    if (sysCurr1 >= CFG_OVERCURRENT_LIMIT_A) {
+      drawTacticalString(86, y + 2, "!18A!", COLOR_AMBER, COLOR_BG, 1);
+    } else {
+      drawTacticalPrintf(88, y + 2, COLOR_LIGHTGREY, COLOR_BG, 1, "%3d",
+                         lightCfg.val);
+    }
   } else if (row == 3) {
     uint16_t boxBorder =
         (sel && isEditing) ? COLOR_AMBER : (sel ? COLOR_CYAN : COLOR_MIDGREY);
@@ -1272,36 +1588,98 @@ void updateLightRow(int row) {
 }
 
 void updateMotorSubpage() {
-  // 1. ToF (VL53L0X) 測距讀數區
-  int yTof = 22;
+  // 1. 即時行程與 ToF 測距區
+  int yTof = 20;
   drawTacticalString(16, yTof, "DIST // TOF", COLOR_LIGHTGREY, COLOR_BG, 1);
-  if (tofDistanceMm >= 0) {
-    drawTacticalPrintf(80, yTof, COLOR_CYAN, COLOR_BG, 1, "%4dMM",
-                       tofDistanceMm);
-    drawTechBar(16, yTof + 11, 96, 7, constrain((int)tofDistanceMm, 0, 1200),
-                1200, COLOR_CYAN);
+  tft.fillRect(72, yTof, 40, 8, COLOR_BG);
+  if (vl53l0xReady && currentTofDistMm > 0.0f) {
+    drawTacticalPrintf(76, yTof, COLOR_CYAN, COLOR_BG, 1, "%4.1fMM",
+                       currentTofDistMm);
+    int strokeMm =
+        constrain((int)(currentTofDistMm - CFG_DEFAULT_Y_MIN_MM + 0.5f), 0,
+                  (int)CFG_DEFAULT_STROKE_SPAN_MM);
+    drawTechBar(16, yTof + 9, 96, 6, strokeMm, (int)CFG_DEFAULT_STROKE_SPAN_MM,
+                COLOR_CYAN);
   } else {
-    drawTacticalString(80, yTof, "--- MM", COLOR_DARKGREY, COLOR_BG, 1);
-    drawTechBar(16, yTof + 11, 96, 7, 0, 1200, COLOR_DARKGREY);
+    drawTacticalString(76, yTof, "---.-MM", COLOR_DARKGREY, COLOR_BG, 1);
+    drawTechBar(16, yTof + 9, 96, 6, 0, (int)CFG_DEFAULT_STROKE_SPAN_MM,
+                COLOR_DARKGREY);
   }
 
-  // 2. 馬達速度 Velocity 設定區
-  int yMot = 48;
-  uint16_t titleCol = isEditing ? COLOR_AMBER : COLOR_CYAN;
-  drawTacticalString(16, yMot, isEditing ? "# VELOCITY" : "> VELOCITY",
-                     titleCol, COLOR_BG, 1);
-  drawTacticalPrintf(84, yMot, titleCol, COLOR_BG, 1, "%3d%%", motorCfg.speed);
+  // 2. 指定位置 (Row 0: TARGET POS)
+  int yTgt = 38;
+  bool isRow0 = (cursorRow == 0);
+  uint16_t tgtTitleCol =
+      isRow0 ? (isEditing ? COLOR_AMBER : COLOR_CYAN) : COLOR_LIGHTGREY;
+  uint16_t tgtBarCol =
+      isRow0 ? (isEditing ? COLOR_AMBER : COLOR_CYAN) : COLOR_MIDGREY;
+  const char *tgtPrefix =
+      isRow0 ? (isEditing ? "# TARGET" : "> TARGET") : "  TARGET";
+  tft.fillRect(16, yTgt, 56, 8, COLOR_BG);
+  drawTacticalString(16, yTgt, tgtPrefix, tgtTitleCol, COLOR_BG, 1);
+  tft.fillRect(72, yTgt, 40, 8, COLOR_BG);
+  drawTacticalPrintf(80, yTgt, tgtTitleCol, COLOR_BG, 1, "%3d%%",
+                     motorCfg.targetPos);
+  drawTechBar(16, yTgt + 9, 96, 8, motorCfg.targetPos, 100, tgtBarCol);
 
-  uint16_t bCol = isEditing ? COLOR_AMBER : COLOR_CYAN;
-  drawTechBar(16, yMot + 13, 96, 12, motorCfg.speed, 100, bCol);
+  // 3. 手動轉速 (Row 1: VELOCITY)
+  int yVel = 58;
+  bool isRow1 = (cursorRow == 1);
+  uint16_t velTitleCol =
+      isRow1 ? (isEditing ? COLOR_AMBER : COLOR_CYAN) : COLOR_LIGHTGREY;
+  uint16_t velBarCol =
+      isRow1 ? (isEditing ? COLOR_AMBER : COLOR_CYAN) : COLOR_MIDGREY;
+  const char *velPrefix =
+      isRow1 ? (isEditing ? "# VELOCITY" : "> VELOCITY") : "  VELOCITY";
+  tft.fillRect(16, yVel, 60, 8, COLOR_BG);
+  drawTacticalString(16, yVel, velPrefix, velTitleCol, COLOR_BG, 1);
+  tft.fillRect(72, yVel, 40, 8, COLOR_BG);
+  drawTacticalPrintf(80, yVel, velTitleCol, COLOR_BG, 1, "%3d%%",
+                     motorCfg.speed);
+  drawTechBar(16, yVel + 9, 96, 8, motorCfg.speed, 100, velBarCol);
 
-  // 3. 預估轉速 RPM
-  int rpm = map(motorCfg.speed, 0, 100, 0, 4800);
-  char rpmBuf[24];
-  snprintf(rpmBuf, sizeof(rpmBuf), "VEL %4d RPM", rpm);
-  int rpmW = getTacticalStringWidth(rpmBuf, 1);
-  drawTacticalString(16 + (96 - rpmW) / 2, yMot + 31, rpmBuf, COLOR_LIGHTGREY,
-                     COLOR_BG, 1);
+  // 4. 動態狀態指示線與遙測數據
+  tft.drawFastHLine(16, 78, 96, COLOR_MIDGREY);
+
+  int yStat = 82;
+  tft.fillRect(16, yStat, 96, 20, COLOR_BG);
+
+  if (motorGuardStatus != GUARD_OK) {
+    drawTacticalString(16, yStat, "! GUARD TRIPPED !", COLOR_AMBER, COLOR_BG,
+                       1);
+    if (motorGuardStatus == GUARD_TRIPPED_OOB) {
+      drawTacticalString(16, yStat + 10, "OUT OF BOUNDS", COLOR_WHITE, COLOR_BG,
+                         1);
+    } else if (motorGuardStatus == GUARD_TRIPPED_STALL) {
+      drawTacticalString(16, yStat + 10, "MOTOR STALLED", COLOR_WHITE, COLOR_BG,
+                         1);
+    } else {
+      drawTacticalString(16, yStat + 10, "SENSOR TIMEOUT", COLOR_WHITE,
+                         COLOR_BG, 1);
+    }
+  } else if (motorServoActive) {
+    drawTacticalPrintf(16, yStat, COLOR_AMBER, COLOR_BG, 1, "MOVING.. P:%3d",
+                       (int)motorCurrentOutPwm);
+    float err = motorTargetMm - currentTofDistMm;
+    drawTacticalPrintf(16, yStat + 10, COLOR_CYAN, COLOR_BG, 1,
+                       "E:%+4.1f V:%+4.1f", err, motorFilteredVelocityMmS);
+  } else if (motorServoArrived) {
+    drawTacticalString(16, yStat, "ARRIVED! [PWM:0]", COLOR_GREEN, COLOR_BG, 1);
+    drawTacticalPrintf(16, yStat + 10, COLOR_LIGHTGREY, COLOR_BG, 1,
+                       "HOLD AT %4.1fMM", currentTofDistMm);
+  } else if (motorCfg.speed > 0) {
+    drawTacticalPrintf(16, yStat, COLOR_CYAN, COLOR_BG, 1, "MANUAL PWM:%3d",
+                       (int)motorCurrentOutPwm);
+    int rpm = map(motorCfg.speed, 0, 100, 0, 4800);
+    drawTacticalPrintf(16, yStat + 10, COLOR_LIGHTGREY, COLOR_BG, 1,
+                       "SPEED %4d RPM", rpm);
+  } else {
+    drawTacticalString(16, yStat, "IDLE [PWM: 0]", COLOR_LIGHTGREY, COLOR_BG,
+                       1);
+    float targetPhysMm = calcTargetMm(motorCfg.targetPos);
+    drawTacticalPrintf(16, yStat + 10, COLOR_LIGHTGREY, COLOR_BG, 1,
+                       "TARGET: %4.1fMM", targetPhysMm);
+  }
 }
 
 void updateSensorsSubpage() {
@@ -1509,6 +1887,11 @@ void loadPreferences() {
   if (motorCfg.speed > 100)
     motorCfg.speed = CFG_DEFAULT_MOTOR_SPEED;
 
+  motorCfg.targetPos =
+      preferences.getUChar("motor_pos", CFG_DEFAULT_TARGET_POS);
+  if (motorCfg.targetPos > 100)
+    motorCfg.targetPos = CFG_DEFAULT_TARGET_POS;
+
   isMuted = preferences.getBool("is_muted", false);
 
   lightBackup = lightCfg;
@@ -1523,6 +1906,7 @@ void savePreferences(bool setSleepFlag) {
   preferences.putUChar("light_val", lightCfg.val);
   preferences.putChar("light_spd", lightCfg.speed);
   preferences.putUChar("motor_spd", motorCfg.speed);
+  preferences.putUChar("motor_pos", motorCfg.targetPos);
   preferences.putBool("is_muted", isMuted);
 }
 
@@ -1535,9 +1919,17 @@ void enterDeepSleep(bool saveToPrefs = true) {
   // 關閉螢幕背光/畫面 (全黑)
   tft.fillScreen(COLOR_BG);
 
+  // 關閉 WS2812 燈條與 NMOS 電源 (GPIO 19 = 0 徹底阻斷待機漏電)
+  strip.clear();
+  strip.show();
+  digitalWrite(PIN_WS2812_EN, LOW);
+
+  // 關閉電池電壓檢測 NMOS (GPIO 2 = 0 徹底阻斷分壓漏電)
+  digitalWrite(PIN_BATTERY_EN, LOW);
+  pinMode(PIN_BATTERY_EN, OUTPUT);
+
   // 蜂鳴器確保靜音
-  ledcWriteTone(BUZZER_PIN, 0);
-  digitalWrite(BUZZER_PIN, HIGH);
+  sfxMute();
 
   // 保持 RTC 外設電源開啟以維持內部上拉
   esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
@@ -1577,7 +1969,7 @@ void triggerSystemReset() {
   delay(10);
   SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
   tft.initR(INITR_144GREENTAB);
-  tft.setRotation(0);
+  tft.setRotation(TFT_ROTATION);
 
   // 3. 戰術重設提示畫面
   tft.fillScreen(COLOR_BG);
@@ -1607,8 +1999,11 @@ void triggerSystemReset() {
   rainAngle = 0.0f;
   thunderState = THUNDER_IDLE;
 
+  stopMotorAll();
   motorCfg.speed = CFG_DEFAULT_MOTOR_SPEED;
+  motorCfg.targetPos = CFG_DEFAULT_TARGET_POS;
   motorBackup = motorCfg;
+  motorGuardStatus = GUARD_OK;
   tofDistanceMm = -1;
 
   // 儲存重設後的預設值至 Preferences 並解除靜音
@@ -1692,7 +2087,48 @@ void calibrateAcs712Zeros() {
                 zeroCurrentMv2);
 }
 
+// I2C 匯流排主動解鎖：若感測器卡在 ACK/Data 狀態將 SDA 咬死，送出 9 個 SCL
+// 脈衝強制釋放
+void recoverI2cBus(uint8_t sdaPin, uint8_t sclPin) {
+  pinMode(sdaPin, INPUT_PULLUP);
+  pinMode(sclPin, OUTPUT);
+  digitalWrite(sclPin, HIGH);
+  delayMicroseconds(50);
+
+  if (digitalRead(sdaPin) == LOW) {
+    Serial.println(F("[I2C RECOVERY] SDA locked LOW! Sending 9 SCL pulses..."));
+    for (int i = 0; i < 9; i++) {
+      digitalWrite(sclPin, LOW);
+      delayMicroseconds(20);
+      digitalWrite(sclPin, HIGH);
+      delayMicroseconds(20);
+      if (digitalRead(sdaPin) == HIGH)
+        break;
+    }
+    pinMode(sdaPin, OUTPUT);
+    digitalWrite(sdaPin, LOW);
+    delayMicroseconds(20);
+    digitalWrite(sclPin, HIGH);
+    delayMicroseconds(20);
+    digitalWrite(sdaPin, HIGH);
+    delayMicroseconds(20);
+    pinMode(sdaPin, INPUT_PULLUP);
+  }
+}
+
 void setup() {
+  // 0. 初始化馬達驅動引腳與 PWM 通道
+  pinMode(PIN_MOTOR_DIR, OUTPUT);
+  digitalWrite(PIN_MOTOR_DIR, LOW);
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(PIN_MOTOR_PWM, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  ledcWrite(PIN_MOTOR_PWM, 0);
+#else
+  ledcSetup(MOTOR_PWM_CH, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  ledcAttachPin(PIN_MOTOR_PWM, MOTOR_PWM_CH);
+  ledcWrite(MOTOR_PWM_CH, 0);
+#endif
+
   // 1. 初始化所有戰術按鍵引腳為內部上拉輸入
   for (int i = 0; i < 4; i++) {
     pinMode(btns[i].pin, INPUT_PULLUP);
@@ -1752,7 +2188,7 @@ void setup() {
 
   SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
   tft.initR(INITR_144GREENTAB);
-  tft.setRotation(0);
+  tft.setRotation(TFT_ROTATION);
 
   tft.fillScreen(COLOR_BG);
   drawTopBar();
@@ -1766,13 +2202,31 @@ void setup() {
   tempConversionPending = true;
 
   // 初始化 VL53L0X 飛行時間測距感測器 (I2C: SDA=GPIO21, SCL=GPIO15)
+  recoverI2cBus(PIN_TOF_SDA, PIN_TOF_SCL);
   Wire.begin(PIN_TOF_SDA, PIN_TOF_SCL);
-  if (lox.begin(VL53L0X_I2C_ADDR, false, &Wire)) {
-    vl53l0xReady = true;
-    Serial.println(F("[SENSOR] VL53L0X ToF Initialized OK (SDA:21, SCL:15)"));
-  } else {
-    vl53l0xReady = false;
+  Wire.setClock(100000);
+  delay(50);
+
+  vl53l0xReady = false;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    if (lox.begin(VL53L0X_I2C_ADDR, false, &Wire)) {
+      vl53l0xReady = true;
+      Serial.println(F("[SENSOR] VL53L0X ToF Initialized OK (SDA:21, SCL:15)"));
+      break;
+    }
+    delay(100);
+  }
+  if (!vl53l0xReady) {
     Serial.println(F("[SENSOR] VL53L0X ToF Init Failed / Not Detected!"));
+  } else {
+    // 預熱中值與 IIR 濾波器
+    for (int i = 0; i < 6; i++) {
+      handleTofSampling();
+      delay(30);
+    }
+    lastMotorMeasuredDistMm = currentTofDistMm;
+    motorActiveTargetMm = currentTofDistMm;
+    motorTargetMm = currentTofDistMm;
   }
 
   // 初始化 ACS712 電流感測器輸入 (CURR 1: GPIO 35 [20A], CURR 2: GPIO 34 [05B
@@ -1784,6 +2238,32 @@ void setup() {
 
   // 執行 ACS712 零電流基準校準 (Tare)
   calibrateAcs712Zeros();
+
+  // 初始化 2S 電池電壓檢測 (GPIO 36, 180k:36k 分壓) 與 NMOS 測量致能 (GPIO 2)
+  pinMode(PIN_BATTERY_EN, OUTPUT);
+  digitalWrite(PIN_BATTERY_EN, LOW); // 預設關閉防漏電
+  pinMode(PIN_BATTERY_ADC, INPUT);
+  analogSetPinAttenuation(PIN_BATTERY_ADC, ADC_11db);
+  for (int i = 0; i < 6; i++) {
+    handleBatterySampling();
+    delay(15);
+  }
+
+  // 初始化 WS2812 幻彩燈條 (GPIO 16) 與 NMOS 供電開關 (GPIO 19)
+  pinMode(PIN_WS2812_EN, OUTPUT);
+  if (lightCfg.val > 0) {
+    digitalWrite(PIN_WS2812_EN, HIGH);
+    delay(50); // 延長開機延時讓電解電容與燈條完全上電穩定
+  } else {
+    digitalWrite(PIN_WS2812_EN, LOW);
+  }
+  strip.begin();
+  strip.setBrightness(255);
+  gpio_set_drive_capability((gpio_num_t)PIN_WS2812, GPIO_DRIVE_CAP_3); // 最大驅動電流 (40mA) 增強長導線上升沿邊緣銳利度
+  strip.show();
+
+  // 初始化 WiFi AP 模式與手機 Web 戰術控制台
+  initWebHud();
 
   // 初始化蜂鳴器音效引擎並播放開機未來戰術音
   sfxInit();
@@ -1846,35 +2326,47 @@ void handleTofSampling() {
   VL53L0X_RangingMeasurementData_t measure;
   lox.rangingTest(&measure, false);
 
-  int16_t newDist = -1;
-  // RangeStatus 4 = Phase Fail (超出範圍或無障礙物)
   if (measure.RangeStatus != 4) {
-    newDist = (int16_t)measure.RangeMilliMeter;
-  }
+    float raw = (float)measure.RangeMilliMeter;
+    if (raw >= 20.0f && raw <= 400.0f) {
+      // 1. 5-Tap 中值濾波 (消滅離群光學毛刺)
+      tofMedianBuf[tofMedianIdx] = raw;
+      tofMedianIdx = (tofMedianIdx + 1) % TOF_MEDIAN_WINDOW;
+      if (tofMedianIdx == 0)
+        tofMedianFilled = true;
+      int count = tofMedianFilled ? TOF_MEDIAN_WINDOW : tofMedianIdx;
+      float med = getTofMedian(tofMedianBuf, count);
 
-  // 數值有變動時局部更新畫面
-  if (newDist != tofDistanceMm) {
-    tofDistanceMm = newDist;
-    if (currentState == STATE_SUBPAGE && carouselIndex == PAGE_MOTOR) {
-      drawSubpageTopBar();
-      updateMotorSubpage();
-    } else if (currentState == STATE_HOME && carouselIndex == PAGE_MOTOR) {
-      // 僅即時更新右上角測距文字，避免重畫中央錶盤造成微抖動
-      int cx = 14, cy = 19;
-      if (tofDistanceMm >= 0) {
-        drawTacticalPrintf(cx + 52, cy + 3, COLOR_CYAN, COLOR_BG, 1, "%4dMM",
-                           tofDistanceMm);
+      // 2. 一階 IIR 低通濾波 (撫平毫米級隨機噪訊)
+      if (!iirTofInitialized) {
+        iirTofDistanceMm = med;
+        iirTofInitialized = true;
       } else {
-        drawTacticalString(cx + 52, cy + 3, "--- MM", COLOR_DARKGREY, COLOR_BG,
-                           1);
+        iirTofDistanceMm =
+            TOF_IIR_ALPHA * iirTofDistanceMm + (1.0f - TOF_IIR_ALPHA) * med;
+      }
+
+      currentTofDistMm = iirTofDistanceMm;
+      lastTofValidReadTime = now;
+      int16_t newDist = (int16_t)(currentTofDistMm + 0.5f);
+
+      // 數值有變動時局部更新畫面
+      if (newDist != tofDistanceMm) {
+        tofDistanceMm = newDist;
+        if (currentState == STATE_SUBPAGE && carouselIndex == PAGE_MOTOR) {
+          updateMotorSubpage();
+        } else if (currentState == STATE_HOME && carouselIndex == PAGE_MOTOR) {
+          int cx = 14, cy = 19;
+          drawTacticalPrintf(cx + 52, cy + 3, COLOR_CYAN, COLOR_BG, 1, "%4dMM",
+                             tofDistanceMm);
+        }
       }
     }
   }
 }
 
-// 讀取 ACS712 電流感測器輸出 (轉換為安培 A)
-float readAcs712Amps(uint8_t pin, float zeroMv, float sensitivity,
-                     float dividerRatio) {
+// 讀取 ACS712 感測器原始輸出電壓 (mV)
+float readAcs712RawMv(uint8_t pin, float dividerRatio) {
   // 切換通道時先執行一次讀取以釋放/充放內部取樣電容，徹底消除多通道串擾
   analogReadMilliVolts(pin);
   delayMicroseconds(30);
@@ -1886,14 +2378,7 @@ float readAcs712Amps(uint8_t pin, float zeroMv, float sensitivity,
     delayMicroseconds(10);
   }
   float pinMv = (float)sumMv / SAMPLES;
-  float sensorMv = pinMv * dividerRatio;
-  float amps = fabs(sensorMv - zeroMv) / sensitivity;
-
-  // 0A 附近微小 ADC 雜訊過濾
-  if (amps < 0.06f) {
-    amps = 0.0f;
-  }
-  return amps;
+  return pinMv * dividerRatio;
 }
 
 void handleCurrentSampling() {
@@ -1902,20 +2387,50 @@ void handleCurrentSampling() {
     return;
   lastCurrentSampleTime = now;
 
-  // 採樣感測器 1 (ACS712-20A, GPIO 35) 與感測器 2 (ACS712T-05B, GPIO 34)
-  float rawCurr1 = readAcs712Amps(PIN_CURRENT_ACS712_1, zeroCurrentMv1,
-                                  CFG_ACS712_1_SENSITIVITY_MV_PER_A,
-                                  CFG_ACS712_1_DIVIDER_RATIO);
-  float rawCurr2 = readAcs712Amps(PIN_CURRENT_ACS712_2, zeroCurrentMv2,
-                                  CFG_ACS712_2_SENSITIVITY_MV_PER_A,
-                                  CFG_ACS712_2_DIVIDER_RATIO);
+  // 採樣感測器 1 (ACS712-20A, GPIO 35) 與感測器 2 (ACS712T-05B, GPIO 34) 原始毫伏
+  float rawMv1 = readAcs712RawMv(PIN_CURRENT_ACS712_1, CFG_ACS712_1_DIVIDER_RATIO);
+  float rawMv2 = readAcs712RawMv(PIN_CURRENT_ACS712_2, CFG_ACS712_2_DIVIDER_RATIO);
+
+  // --- C1 (WS2812 燈條 20A) 動態零點追蹤與電流計算 ---
+  float rawCurr1 = 0.0f;
+  bool lightIsOff = (lightCfg.val == 0 || digitalRead(PIN_WS2812_EN) == LOW);
+  if (lightIsOff) {
+    // 燈條關閉狀態下物理電流必為 0A，主動動態追蹤溫漂與零點電壓
+    if (rawMv1 >= 500.0f && rawMv1 <= 3200.0f) {
+      zeroCurrentMv1 = (zeroCurrentMv1 * 0.90f) + (rawMv1 * 0.10f);
+    }
+    rawCurr1 = 0.0f;
+  } else {
+    // 燈條亮起時凍結零點基準，計算即時電流
+    rawCurr1 = fabs(rawMv1 - zeroCurrentMv1) / CFG_ACS712_1_SENSITIVITY_MV_PER_A;
+    if (rawCurr1 < CFG_ACS712_1_DEADBAND_AMPS) {
+      rawCurr1 = 0.0f;
+    }
+  }
+
+  // --- C2 (馬達驅動/H橋 S09 12V 05B) 動態零點追蹤與電流計算 ---
+  float rawCurr2 = 0.0f;
+  bool motorIsIdle = (motorCurrentOutPwm <= 0.01f && !motorServoActive && motorCfg.speed == 0);
+  if (motorIsIdle) {
+    // 馬達怠速靜止且無 PWM 輸出時物理電流必為 0A，主動動態追蹤溫漂與零點電壓
+    if (rawMv2 >= 500.0f && rawMv2 <= 3200.0f) {
+      zeroCurrentMv2 = (zeroCurrentMv2 * 0.90f) + (rawMv2 * 0.10f);
+    }
+    rawCurr2 = 0.0f;
+  } else {
+    // 馬達運轉時凍結零點基準，精準計算負載電流
+    rawCurr2 = fabs(rawMv2 - zeroCurrentMv2) / CFG_ACS712_2_SENSITIVITY_MV_PER_A;
+    if (rawCurr2 < CFG_ACS712_2_DEADBAND_AMPS) {
+      rawCurr2 = 0.0f;
+    }
+  }
 
   // 低通濾波穩定讀數 (70% 舊值 + 30% 新值)
-  float filt1 = (sysCurr1 * 0.7f) + (rawCurr1 * 0.3f);
+  float filt1 = lightIsOff ? 0.0f : ((sysCurr1 * 0.7f) + (rawCurr1 * 0.3f));
   if (filt1 < 0.04f)
     filt1 = 0.0f;
 
-  float filt2 = (sysCurr2 * 0.7f) + (rawCurr2 * 0.3f);
+  float filt2 = motorIsIdle ? 0.0f : ((sysCurr2 * 0.7f) + (rawCurr2 * 0.3f));
   if (filt2 < 0.03f)
     filt2 = 0.0f;
 
@@ -1927,13 +2442,12 @@ void handleCurrentSampling() {
   if (c2Changed)
     sysCurr2 = filt2;
 
-  // 定期輸出 Serial 監控數值 (方便實測觀察毫伏與安培數)
+  // 定期輸出 Serial 監控數值 (包含原始毫伏與零點基準，方便即時觀察)
   static unsigned long lastCurrLogTime = 0;
   if (now - lastCurrLogTime >= 1500) {
     lastCurrLogTime = now;
-    Serial.printf("[CURR] C1 (20A, GPIO35): %2.2fA (Zero: %1.0fmV) | C2 (05B, "
-                  "GPIO34): %2.2fA (Zero: %1.0fmV)\n",
-                  sysCurr1, zeroCurrentMv1, sysCurr2, zeroCurrentMv2);
+    Serial.printf("[CURR] C1 (20A, GPIO35): %2.2fA (Raw: %.0fmV, Zero: %.0fmV) | C2 (05B, GPIO34): %2.2fA (Raw: %.0fmV, Zero: %.0fmV)\n",
+                  sysCurr1, rawMv1, zeroCurrentMv1, sysCurr2, rawMv2, zeroCurrentMv2);
   }
 
   if (c1Changed || c2Changed) {
@@ -1959,12 +2473,238 @@ void handleCurrentSampling() {
   }
 }
 
+void handleBatterySampling() {
+  unsigned long now = millis();
+  if (now - lastBatSampleTime < CFG_BAT_SAMPLE_INTERVAL_MS)
+    return;
+  lastBatSampleTime = now;
+
+  // 1. 打通 NMOS 導通分壓電路 (GPIO 2 = HIGH)
+  digitalWrite(PIN_BATTERY_EN, HIGH);
+  delay(15); // 給予充足時間讓 RC 濾波電容 (180k//36k) 與 NMOS 完全導通穩定
+
+  // 預讀一次釋放內部取樣電容，消除多通道取樣串擾
+  analogReadMilliVolts(PIN_BATTERY_ADC);
+  delayMicroseconds(50);
+
+  // 2. 讀取 GPIO 36 類比電壓 (mV)
+  uint32_t sumMv = 0;
+  const int SAMPLES = 32;
+  for (int i = 0; i < SAMPLES; i++) {
+    sumMv += analogReadMilliVolts(PIN_BATTERY_ADC);
+    delayMicroseconds(50);
+  }
+
+  // 3. 採樣完成立即關閉 NMOS，阻斷漏電 (GPIO 2 = LOW)
+  digitalWrite(PIN_BATTERY_EN, LOW);
+
+  float pinMv = (float)sumMv / SAMPLES;
+  float batVolt = (pinMv * CFG_BAT_DIVIDER_RATIO) / 1000.0f; // 換算實際電池電壓
+
+  // 若為開機初次採樣，直接賦值避免 7.4V 平滑延遲
+  static bool firstSample = true;
+  if (firstSample) {
+    firstSample = false;
+    sysBatteryVolt = batVolt;
+  } else {
+    // 80% 歷史平滑 + 20% 當前測量
+    sysBatteryVolt = (sysBatteryVolt * 0.8f) + (batVolt * 0.2f);
+  }
+
+  // 映射至 2S 電池百分比 (6.4V ~ 8.4V)
+  float pct = ((sysBatteryVolt - CFG_BAT_VOLT_MIN) /
+               (CFG_BAT_VOLT_MAX - CFG_BAT_VOLT_MIN)) *
+              100.0f;
+  pct = constrain(pct, 0.0f, 100.0f);
+  int newPct = (int)(pct + 0.5f);
+
+  if (newPct != sysBatteryPct) {
+    sysBatteryPct = newPct;
+    if (currentState == STATE_HOME) {
+      drawTopBar();
+    }
+  }
+
+  // 每 2 秒輸出電池除錯數據至 Serial
+  static unsigned long lastBatLogTime = 0;
+  if (now - lastBatLogTime >= 2000) {
+    lastBatLogTime = now;
+    Serial.printf("[BATTERY] Raw ADC: %1.1fmV | BatVolt: %1.2fV | Filtered: %1.2fV (%d%%)\n",
+                  pinMv, batVolt, sysBatteryVolt, sysBatteryPct);
+  }
+}
+
+void handleMotorControl() {
+  unsigned long now = millis();
+  if (now - lastMotorCtrlTimeMs < MOTOR_CTRL_PERIOD_MS)
+    return;
+  float dt = (now - lastMotorCtrlTimeMs) / 1000.0f;
+  lastMotorCtrlTimeMs = now;
+
+  // 速度估算 (微分阻尼濾波)
+  if (currentTofDistMm > 0.0f) {
+    float rawVel = (currentTofDistMm - lastMotorMeasuredDistMm) / dt;
+    lastMotorMeasuredDistMm = currentTofDistMm;
+    motorFilteredVelocityMmS = 0.7f * motorFilteredVelocityMmS + 0.3f * rawVel;
+  }
+
+  // 1. 伺服移動模式 (Closed-Loop Servo)
+  if (motorServoActive) {
+    // 感測器失聯保護
+    if (now - lastTofValidReadTime > SENSOR_TIMEOUT_MS) {
+      emergencyStopMotor(GUARD_TRIPPED_SENSOR_TIMEOUT);
+      if (currentState == STATE_SUBPAGE && carouselIndex == PAGE_MOTOR)
+        updateMotorSubpage();
+      return;
+    }
+
+    // 物理行程超限保護
+    if (currentTofDistMm < (CFG_DEFAULT_Y_MIN_MM - GUARDRAIL_MARGIN_MM) ||
+        currentTofDistMm > (CFG_DEFAULT_Y_MAX_MM + GUARDRAIL_MARGIN_MM)) {
+      emergencyStopMotor(GUARD_TRIPPED_OOB);
+      if (currentState == STATE_SUBPAGE && carouselIndex == PAGE_MOTOR)
+        updateMotorSubpage();
+      return;
+    }
+
+    // 堵轉保護
+    if (motorCurrentOutPwm >= GUARDRAIL_STALL_PWM) {
+      if (motorHighEffortStartTime == 0) {
+        motorHighEffortStartTime = now;
+        motorStallCheckStartDist = currentTofDistMm;
+      } else if (now - motorHighEffortStartTime > GUARDRAIL_STALL_MS) {
+        if (fabs(currentTofDistMm - motorStallCheckStartDist) <
+            GUARDRAIL_STALL_MIN_DY) {
+          emergencyStopMotor(GUARD_TRIPPED_STALL);
+          if (currentState == STATE_SUBPAGE && carouselIndex == PAGE_MOTOR)
+            updateMotorSubpage();
+          return;
+        }
+      }
+    } else {
+      motorHighEffortStartTime = 0;
+    }
+
+    // 平滑軌跡步進 (30 mm/s)
+    float maxStep = maxProfileVelMmS * dt;
+    if (motorActiveTargetMm < motorTargetMm) {
+      motorActiveTargetMm += maxStep;
+      if (motorActiveTargetMm > motorTargetMm)
+        motorActiveTargetMm = motorTargetMm;
+    } else if (motorActiveTargetMm > motorTargetMm) {
+      motorActiveTargetMm -= maxStep;
+      if (motorActiveTargetMm < motorTargetMm)
+        motorActiveTargetMm = motorTargetMm;
+    }
+
+    // Profile Anti-Windup (最多超前/落後 6.0mm)
+    const float MAX_PROFILE_LAG_MM = 6.0f;
+    motorActiveTargetMm =
+        constrain(motorActiveTargetMm, currentTofDistMm - MAX_PROFILE_LAG_MM,
+                  currentTofDistMm + MAX_PROFILE_LAG_MM);
+
+    float error = motorActiveTargetMm - currentTofDistMm;
+    float absErr = fabs(error);
+    float targetErr = fabs(motorTargetMm - currentTofDistMm);
+
+    // 到達判斷：若距離最終目標 <= 2.0mm 且速度已降至靜止範圍 (< 6.0mm/s)
+    // 【核心要求】：到定點後切回一般模式的 pwm0
+    if (targetErr <= 2.0f && fabs(motorFilteredVelocityMmS) < 6.0f) {
+      setMotorRaw(true, 0);
+      motorCurrentOutPwm = 0.0f;
+      motorIntegralErr = 0.0f;
+      motorServoActive = false; // 關閉伺服狀態
+      motorServoArrived = true; // 標記已成功抵達
+      motorCfg.speed = 0;       // 切回一般模式的 pwm 0
+      sfxEnter();               // 抵達戰術提示音
+      Serial.printf("[SERVO ARRIVED] Target reached: %0.1f mm. Power cut to "
+                    "PWM: 0 (Normal mode idle)\n",
+                    currentTofDistMm);
+      if (currentState == STATE_SUBPAGE && carouselIndex == PAGE_MOTOR) {
+        updateMotorSubpage();
+      }
+      return;
+    }
+
+    // PID + 前饋計算
+    float baseFf = getScotchYokeFeedforward(currentTofDistMm);
+    float ffWeight = 1.0f;
+    if (absErr < 8.0f) {
+      ffWeight = (absErr - 2.0f) / 6.0f;
+      if (ffWeight < 0.0f)
+        ffWeight = 0.0f;
+    }
+    float effectiveFf = baseFf * ffWeight;
+
+    float pOut = motorKp * absErr;
+    bool forward = (error > 0.0f);
+
+    if (absErr > 2.0f && absErr < 6.0f) {
+      motorIntegralErr += (forward ? 1.0f : -1.0f) * absErr * dt;
+      motorIntegralErr = constrain(motorIntegralErr, -15.0f, 15.0f);
+    } else {
+      motorIntegralErr = 0.0f;
+    }
+    float iOut = motorKi * motorIntegralErr;
+
+    float dDamping = forward ? (-motorKd * motorFilteredVelocityMmS)
+                             : (+motorKd * motorFilteredVelocityMmS);
+
+    float desiredCmd = effectiveFf + pOut + (forward ? iOut : -iOut) + dDamping;
+    desiredCmd = constrain(desiredCmd, 30.0f, 220.0f);
+
+    // 斜率限制
+    if (desiredCmd > motorCurrentOutPwm + MAX_PWM_SLEW_UP) {
+      motorCurrentOutPwm += MAX_PWM_SLEW_UP;
+    } else if (desiredCmd < motorCurrentOutPwm - MAX_PWM_SLEW_DOWN) {
+      motorCurrentOutPwm -= MAX_PWM_SLEW_DOWN;
+    } else {
+      motorCurrentOutPwm = desiredCmd;
+    }
+
+    uint8_t outDuty = (uint8_t)constrain(motorCurrentOutPwm, 0.0f, 255.0f);
+
+    // 頂點翻轉死點保護
+    if (forward && currentTofDistMm > (CFG_DEFAULT_Y_MAX_MM - 8.0f) &&
+        motorFilteredVelocityMmS < -8.0f) {
+      setMotorRaw(true, 0);
+      motorCurrentOutPwm = 0.0f;
+      motorIntegralErr = 0.0f;
+      motorActiveTargetMm = currentTofDistMm;
+    } else {
+      setMotorRaw(forward, outDuty);
+    }
+
+    // 在子分頁中動態刷新狀態與即時 PWM
+    static unsigned long lastMotorUiRefresh = 0;
+    if (currentState == STATE_SUBPAGE && carouselIndex == PAGE_MOTOR &&
+        (now - lastMotorUiRefresh >= 120)) {
+      lastMotorUiRefresh = now;
+      updateMotorSubpage();
+    }
+  }
+  // 2. 一般手動模式 (Normal Mode)
+  else {
+    if (motorCfg.speed > 0 && motorGuardStatus == GUARD_OK) {
+      uint8_t duty = map(motorCfg.speed, 0, 100, 0, 255);
+      setMotorRaw(true, duty);
+      motorCurrentOutPwm = duty;
+    } else {
+      setMotorRaw(true, 0);
+      motorCurrentOutPwm = 0.0f;
+    }
+  }
+}
+
 void loop() {
   scanButtons();
   handleTemperatureSampling();
   handleTofSampling();
   handleCurrentSampling();
+  handleBatterySampling();
   handleLightAnimation();
+  handleMotorControl();
+  handleWebHud();
 
   unsigned long now = millis();
 
@@ -2139,9 +2879,14 @@ void loop() {
             lightCfg.sat =
                 constrain(lightCfg.sat + CFG_STEP_SATURATION, 0, 100);
           if (cursorRow == 2 &&
-              (btns[1].justPressed || btns[1].repeatTriggered))
-            lightCfg.val =
-                constrain(lightCfg.val + CFG_STEP_BRIGHTNESS, 0, 100);
+              (btns[1].justPressed || btns[1].repeatTriggered)) {
+            if (sysCurr1 >= CFG_OVERCURRENT_LIMIT_A) {
+              sfxWarning(); // 18A 電流防護：阻止調高亮度並發出警報音
+            } else {
+              lightCfg.val =
+                  constrain(lightCfg.val + CFG_STEP_BRIGHTNESS, 0, 100);
+            }
+          }
           if (cursorRow == 3 && btns[1].justPressed) {
             lightCfg.style = (lightCfg.style + 1) % TOTAL_LIGHT_MODES;
             for (int r = 0; r < 5; r++)
@@ -2231,47 +2976,121 @@ void loop() {
       }
     } else if (carouselIndex == PAGE_MOTOR) {
       if (!isEditing) {
-        if (btns[0].justPressed) {
-          sfxEnter();
-          isEditing = true;
-          motorBackup = motorCfg;
+        // [左翼 UP] 按鍵 C (Q): 游標切換到 TARGET (0) 或 VELOCITY (1)
+        if (btns[2].justPressed) {
+          sfxNavigate();
+          cursorRow = (cursorRow - 1 + 2) % 2;
           updateMotorSubpage();
-          drawSideButtons();
-          updateGlobalButtonBar();
         }
+        // [右翼 DOWN] 按鍵 B (W): 游標切換到 TARGET (0) 或 VELOCITY (1)
+        if (btns[1].justPressed) {
+          sfxNavigate();
+          cursorRow = (cursorRow + 1) % 2;
+          updateMotorSubpage();
+        }
+        // [底右 ENTER] 按鍵 A (E): 進入編輯模式 (若防護欄觸發則先清除故障)
+        if (btns[0].justPressed) {
+          if (motorGuardStatus != GUARD_OK) {
+            motorGuardStatus = GUARD_OK;
+            sfxEnter();
+            updateMotorSubpage();
+          } else {
+            sfxEnter();
+            isEditing = true;
+            motorBackup = motorCfg;
+            updateMotorSubpage();
+            drawSideButtons();
+            updateGlobalButtonBar();
+          }
+        }
+        // [底左 BACK] 按鍵 D (R):
+        // 若馬達正在移動中，按 BACK 立即緊急煞車停機；
+        // 若馬達已處於停止狀態，按 BACK 返回 HUD 首頁。
         if (btns[3].justPressed) {
-          sfxBack();
-          currentState = STATE_HOME;
-          stateSwitchLockout = millis() + 200;
-          playSubpageExitTransition();
+          if (motorServoActive || motorCfg.speed > 0) {
+            stopMotorAll();
+            sfxWarning();
+            updateMotorSubpage();
+          } else {
+            sfxBack();
+            currentState = STATE_HOME;
+            stateSwitchLockout = millis() + 200;
+            playSubpageExitTransition();
+          }
         }
       } else {
-        if (btns[1].justPressed) {
-          motorCfg.speed = constrain(motorCfg.speed + CFG_STEP_MOTOR, 0, 100);
-          updateMotorSubpage();
-          drawSubpageTopBar();
+        // === 編輯模式 (isEditing == true) ===
+        // Row 0: 指定位置調整 (調整時馬達不移動，按確定才開始移動)
+        if (cursorRow == 0) {
+          if (btns[1].justPressed || btns[1].repeatTriggered) {
+            motorCfg.targetPos =
+                constrain(motorCfg.targetPos + CFG_STEP_TARGET_POS, 0, 100);
+            updateMotorSubpage();
+            drawSubpageTopBar();
+          }
+          if (btns[2].justPressed || btns[2].repeatTriggered) {
+            motorCfg.targetPos = constrain(
+                (int)motorCfg.targetPos - (int)CFG_STEP_TARGET_POS, 0, 100);
+            updateMotorSubpage();
+            drawSubpageTopBar();
+          }
+          // [底右 ENTER] 按鍵 A (E): 確定！儲存設定並啟動伺服移動到定點！
+          if (btns[0].justPressed) {
+            sfxEnter();
+            isEditing = false;
+            savePreferences(false);
+            startMotorServoToPct((float)motorCfg.targetPos);
+            updateMotorSubpage();
+            drawSideButtons();
+            updateGlobalButtonBar();
+            drawSubpageTopBar();
+          }
+          // [底左 BACK] 按鍵 D (R): 取消修改並退出編輯 (不移動馬達)
+          else if (btns[3].justPressed) {
+            sfxBack();
+            motorCfg = motorBackup;
+            isEditing = false;
+            updateMotorSubpage();
+            drawSideButtons();
+            updateGlobalButtonBar();
+            drawSubpageTopBar();
+          }
         }
-        if (btns[2].justPressed) {
-          motorCfg.speed = constrain(motorCfg.speed - CFG_STEP_MOTOR, 0, 100);
-          updateMotorSubpage();
-          drawSubpageTopBar();
-        }
-        // [底右 ENTER] 按鍵 A (E) 儲存 或 [底左 BACK] 按鍵 D (R) 鎖定退出
-        if (btns[0].justPressed) {
-          sfxEnter();
-          isEditing = false;
-          updateMotorSubpage();
-          drawSideButtons();
-          updateGlobalButtonBar();
-          drawSubpageTopBar();
-        } else if (btns[3].justPressed) {
-          sfxBack();
-          motorCfg = motorBackup;
-          isEditing = false;
-          updateMotorSubpage();
-          drawSideButtons();
-          updateGlobalButtonBar();
-          drawSubpageTopBar();
+        // Row 1: 手動速度調節
+        else if (cursorRow == 1) {
+          if (btns[1].justPressed || btns[1].repeatTriggered) {
+            motorCfg.speed = constrain(motorCfg.speed + CFG_STEP_MOTOR, 0, 100);
+            updateMotorSubpage();
+            drawSubpageTopBar();
+          }
+          if (btns[2].justPressed || btns[2].repeatTriggered) {
+            motorCfg.speed =
+                constrain((int)motorCfg.speed - (int)CFG_STEP_MOTOR, 0, 100);
+            updateMotorSubpage();
+            drawSubpageTopBar();
+          }
+          // [底右 ENTER] 按鍵 A (E): 確定手動轉速 (若 > 0 則切換至手動運轉)
+          if (btns[0].justPressed) {
+            sfxEnter();
+            isEditing = false;
+            motorServoActive = false;
+            motorServoArrived = false;
+            savePreferences(false);
+            updateMotorSubpage();
+            drawSideButtons();
+            updateGlobalButtonBar();
+            drawSubpageTopBar();
+          }
+          // [底左 BACK] 按鍵 D (R): 取消修改並退出編輯
+          else if (btns[3].justPressed) {
+            sfxBack();
+            motorCfg = motorBackup;
+            isEditing = false;
+            updateMotorSubpage();
+            drawSideButtons();
+            updateGlobalButtonBar();
+            drawSubpageTopBar();
+          }
         }
       }
     } else if (carouselIndex == PAGE_SENSORS) {

@@ -1,3 +1,6 @@
 # Local machine / developer specific configurations
 .vscode/
 flash.ps1
+# Thruster logs
+.thruster/logs/
+.thruster/crashes/

@@ -9,28 +9,28 @@
 // 全域靜音狀態旗標 (定義於主程式 wingUI.ino)
 extern bool isMuted;
 
+// 快速靜音 (解綁 LEDC 計時器並設定為硬體 GPIO 靜態電平，徹底截止三極管消除雜音)
+inline void sfxMute() {
+  ledcDetach(BUZZER_PIN);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, BUZZER_IDLE_LEVEL);
+}
+
 // 基礎單音播放 (Tone & Silence) - 靜音模式下自動不發聲
 inline void sfxTone(uint32_t freq, uint32_t durationMs) {
   if (isMuted) return;
   if (freq == 0) {
-    ledcWriteTone(BUZZER_PIN, 0);
+    sfxMute();
   } else {
+    ledcAttach(BUZZER_PIN, freq, BUZZER_TIMER_RES);
     ledcWriteTone(BUZZER_PIN, freq);
+    delay(durationMs);
+    sfxMute();
   }
-  delay(durationMs);
-  ledcWriteTone(BUZZER_PIN, 0);
-}
-
-// 快速靜音
-inline void sfxMute() {
-  ledcWriteTone(BUZZER_PIN, 0);
 }
 
 // 初始化蜂鳴器
 inline void sfxInit() {
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, HIGH); // 低電平觸發模組：預設 HIGH 保持靜音
-  ledcAttach(BUZZER_PIN, 2000, BUZZER_TIMER_RES);
   sfxMute();
 }
 

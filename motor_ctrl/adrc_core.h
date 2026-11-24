@@ -19,14 +19,11 @@ typedef struct {
   float y_max;
   float stroke_span;
 
-  // --- 雙閥值摩擦補償 (正規化 0.0 ~ 1.0) ---
-  // 1. 靜摩擦起步突破閥值 (Breakaway Stiction)
-  float u_breakaway_pos;
-  float u_breakaway_neg;
-  // 2. 動摩擦滑動維持閥值 (Kinetic Running Friction)
-  float u_kinetic_pos;
-  float u_kinetic_neg;
-  // 速度過渡門檻
+  // --- 位置相依雙閥值摩擦補償 (正規化 0.0 ~ 1.0) ---
+  float u_mid_breakaway;
+  float u_mid_kinetic;
+  float u_dead_breakaway;
+  float u_dead_kinetic;
   float v_stiction_thresh;
 
   // --- 動態控制權重與極性 ---
@@ -118,10 +115,10 @@ inline void ADRC_Init(ADRC_Controller_t *adrc, float dt_seconds) {
   adrc->y_max = CFG_DEFAULT_Y_MAX_MM;
   adrc->stroke_span = adrc->y_max - adrc->y_min;
 
-  adrc->u_breakaway_pos = CFG_DEFAULT_U_BREAKAWAY_POS;
-  adrc->u_breakaway_neg = CFG_DEFAULT_U_BREAKAWAY_NEG;
-  adrc->u_kinetic_pos   = CFG_DEFAULT_U_KINETIC_POS;
-  adrc->u_kinetic_neg   = CFG_DEFAULT_U_KINETIC_NEG;
+  adrc->u_mid_breakaway  = CFG_DEFAULT_U_MID_BREAKAWAY;
+  adrc->u_mid_kinetic    = CFG_DEFAULT_U_MID_KINETIC;
+  adrc->u_dead_breakaway = CFG_DEFAULT_U_DEAD_BREAKAWAY;
+  adrc->u_dead_kinetic   = CFG_DEFAULT_U_DEAD_KINETIC;
   adrc->v_stiction_thresh = CFG_STICTION_VELOCITY_THRESH_MM_S;
 
   adrc->b0_init = CFG_DEFAULT_B0_INIT;
@@ -165,7 +162,7 @@ inline float ADRC_Update(ADRC_Controller_t *adrc, float y_ref_mm, float y_meas_m
   DelayBuffer_Push(db, y_meas_mm);
   float y_delayed = DelayBuffer_Get(db);
 
-  // 2. 擴展狀態觀測器 (ESO) 迭代更新
+  // 2. 擴展狀態觀測器 (ESO) 迭代更新 (含數值防護鉗位)
   float beta1 = 3.0f * adrc->omega_o;
   float beta2 = 3.0f * adrc->omega_o * adrc->omega_o;
   float beta3 = adrc->omega_o * adrc->omega_o * adrc->omega_o;
@@ -176,6 +173,10 @@ inline float ADRC_Update(ADRC_Controller_t *adrc, float y_ref_mm, float y_meas_m
   adrc->z1 += adrc->dt * (adrc->z2 - beta1 * e);
   adrc->z2 += adrc->dt * (adrc->z3 - beta2 * e + adrc->b0 * adrc->u_prev1);
   adrc->z3 += adrc->dt * (-beta3 * e);
+
+  // 物理極限數值鉗位 (防止離散時間步長導致的數值發散)
+  adrc->z2 = adrc_clamp(adrc->z2, -250.0f, 250.0f); // 速度物理上限 +-250 mm/s
+  adrc->z3 = adrc_clamp(adrc->z3, -3000.0f, 3000.0f); // 總擾動物理上限 +-3000 mm/s^2
 
   // 3. CFDL 動態即時控制權重 b0(t) 自適應更新
   float a_curr = (adrc->z2 - adrc->a_prev) / adrc->dt;
@@ -209,28 +210,38 @@ inline float ADRC_Update(ADRC_Controller_t *adrc, float y_ref_mm, float y_meas_m
   // 動態極性校正
   u_raw *= (float)adrc->polarity;
 
-  // 5. 雙閥值摩擦補償 (Dual-Threshold Friction Compensation with Stribeck Transition)
-  //    依據觀測器估計之速度 z2，平滑切換「靜摩擦突破前饋」與「動摩擦滑行前饋」
+  // 5. Scotch Yoke 位置相依與速度自適應摩擦補償 (Position & Velocity Stribeck Shaping)
+  // (A) 計算死點接近度 eta: 中心(50%)時 eta=0.0，兩端(0%或100%)時 eta=1.0
+  float norm_pos = 0.5f;
+  if (adrc->stroke_span > 0.1f) {
+    norm_pos = (adrc->z1 - adrc->y_min) / adrc->stroke_span;
+  }
+  norm_pos = adrc_clamp(norm_pos, 0.0f, 1.0f);
+  float eta = adrc_abs(norm_pos - 0.5f) * 2.0f; // 0.0 ~ 1.0
+  float eta3 = eta * eta * eta; // 三次曲線過渡：只有在逼近死點時才陡升
+
+  // 根據位置計算出當前位置的 Breakaway 與 Kinetic 前饋
+  float pos_breakaway = adrc->u_mid_breakaway + (adrc->u_dead_breakaway - adrc->u_mid_breakaway) * eta3;
+  float pos_kinetic   = adrc->u_mid_kinetic   + (adrc->u_dead_kinetic   - adrc->u_mid_kinetic)   * eta3;
+
+  // (B) 根據觀測器估計速度 z2，在起步突破與滑行維持之間平滑切換
   float speed = adrc_abs(adrc->z2);
   float stiction_factor = 1.0f;
   if (speed < adrc->v_stiction_thresh) {
-    // 速度低於門檻時：隨速度平滑下降 (1.0 -> 0.0)
     stiction_factor = 1.0f - (speed / adrc->v_stiction_thresh);
   } else {
-    // 已經順暢滑行：完全過渡到純動摩擦
     stiction_factor = 0.0f;
   }
 
-  float eff_dead_pos = adrc->u_kinetic_pos + stiction_factor * (adrc->u_breakaway_pos - adrc->u_kinetic_pos);
-  float eff_dead_neg = adrc->u_kinetic_neg + stiction_factor * (adrc->u_breakaway_neg - adrc->u_kinetic_neg);
+  float eff_feedforward = pos_kinetic + stiction_factor * (pos_breakaway - pos_kinetic);
 
   float u_cmd = 0.0f;
-  const float EPS_ZERO = 0.005f;
+  const float EPS_ZERO = 0.003f; // 縮小盲區
 
   if (u_raw > EPS_ZERO) {
-    u_cmd = u_raw + eff_dead_pos;
+    u_cmd = u_raw + eff_feedforward;
   } else if (u_raw < -EPS_ZERO) {
-    u_cmd = u_raw - eff_dead_neg;
+    u_cmd = u_raw - eff_feedforward;
   } else {
     u_cmd = 0.0f;
   }
